@@ -1,0 +1,126 @@
+# @shrug/forgejo — Next Steps
+
+Published: `2026.04.13.1`  
+Covers: read-only queries (repos, issues, PRs, releases)
+
+---
+
+## 1. CRUD methods
+
+None of the write paths are implemented yet. Add these as a version bump with
+`export const extension` targeting `@shrug/forgejo`.
+
+### Issues & pull requests
+
+| Method | API | Notes |
+|--------|-----|-------|
+| `create_issue` | `POST /repos/{owner}/{repo}/issues` | title, body, labels, assignees |
+| `edit_issue` | `PATCH /repos/{owner}/{repo}/issues/{index}` | title, body, state, milestone |
+| `create_issue_comment` | `POST /repos/{owner}/{repo}/issues/{index}/comments` | body |
+| `create_pull` | `POST /repos/{owner}/{repo}/pulls` | head, base, title, body |
+| `merge_pull` | `POST /repos/{owner}/{repo}/pulls/{index}/merge` | merge_message_field, Do (merge/squash/rebase) |
+
+### Repos
+
+| Method | API | Notes |
+|--------|-----|-------|
+| `create_repo` | `POST /user/repos` | name, description, private, auto_init |
+| `create_org_repo` | `POST /orgs/{org}/repos` | same fields |
+| `delete_repo` | `DELETE /repos/{owner}/{repo}` | destructive — add pre-flight check |
+| `fork_repo` | `POST /repos/{owner}/{repo}/forks` | organization optional |
+
+### Releases
+
+| Method | API | Notes |
+|--------|-----|-------|
+| `create_release` | `POST /repos/{owner}/{repo}/releases` | tag_name, name, body, prerelease, draft |
+| `delete_release` | `DELETE /repos/{owner}/{repo}/releases/{id}` | requires stored release id |
+
+---
+
+## 2. Gitea Actions / CI
+
+The `GET /repos/{owner}/{repo}/actions/runs` endpoint lists workflow runs.
+Useful for monitoring CI status from swamp workflows.
+
+| Method | API |
+|--------|-----|
+| `list_runs` | `GET /repos/{owner}/{repo}/actions/runs` |
+| `get_run` | `GET /repos/{owner}/{repo}/actions/runs/{run_id}` |
+| `list_run_jobs` | `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` |
+
+Note: Gitea Actions endpoints require Gitea ≥ 1.21. Forgejo support may vary —
+smoke test against your instance before publishing.
+
+---
+
+## 3. Webhooks
+
+Useful for registering swamp workflows as Gitea webhook receivers.
+
+| Method | API |
+|--------|-----|
+| `list_hooks` | `GET /repos/{owner}/{repo}/hooks` |
+| `create_hook` | `POST /repos/{owner}/{repo}/hooks` |
+| `delete_hook` | `DELETE /repos/{owner}/{repo}/hooks/{id}` |
+
+---
+
+## 4. Known limitations in v1
+
+- **Pagination is manual.** All list methods expose `page` and `limit` args but
+  do not auto-paginate. For repos with >50 issues, the caller must loop pages.
+  Consider adding an `all` shorthand that collects all pages automatically.
+
+- **PR diff stats absent from lists.** `additions`, `deletions`, and
+  `changed_files` are `undefined` in `list_pulls` results (Gitea only populates
+  them on individual `GET /pulls/{index}` calls). The schema marks these
+  `.optional()`. Use `get_pull` when you need diff counts.
+
+- **No rate limit handling.** If the API returns `429 Too Many Requests`, the
+  method throws immediately. A future version should inspect the `Retry-After`
+  header and retry with backoff.
+
+- **`get_pull` untested against a live PR.** The smoke test instance had no open
+  PRs at the time. The schema is correct per the swagger spec but should be
+  validated against a real PR before relying on it in production workflows.
+
+- **Instance names use `__` as separator.** CEL expressions reference per-repo
+  data with the `owner__repo` pattern:
+  ```
+  data.latest("forgejo", "shrug.games__infra").attributes.issues
+  data.latest("forgejo", "neil__aoc2024").attributes
+  ```
+
+---
+
+## 5. Testing gaps
+
+- No unit tests written. Use `@swamp-club/swamp-testing` with
+  `createModelTestContext` to mock the `fetch` calls. Priority targets:
+  - `list_issues` — verify `type=issues` param is included (excludes PRs)
+  - `PullRequestSchema` parse — verify optional diff stat fields don't error
+  - `apiGet` error path — verify 4xx/5xx throws with status + body
+
+- `list_pulls --state all` not smoke-tested.
+
+- `list_releases` only tested against a repo with zero releases. Test against
+  `neilhanlon/lxc-templates` (has 4 releases) to exercise the release schema.
+
+---
+
+## 6. Nice-to-haves
+
+- **`search_repos`** — `GET /repos/search?q=...&topic=true` for discovering
+  public repos across the instance.
+
+- **`list_org_repos`** — `GET /orgs/{org}/repos` scoped to an org, rather than
+  the authenticated user's full list.
+
+- **`get_user`** — `GET /users/{username}` for resolving contributor info.
+
+- **`list_labels`** — `GET /repos/{owner}/{repo}/labels` to enumerate labels
+  before creating issues.
+
+- **Sensitive output for `create_release` assets** — if release asset upload is
+  added, presigned URLs should use `z.meta({ sensitive: true })`.

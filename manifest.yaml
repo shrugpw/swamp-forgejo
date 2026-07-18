@@ -1,0 +1,72 @@
+manifestVersion: 1
+name: "@shrug/forgejo"
+version: "2026.07.17.1"
+description: |
+  Query [Forgejo](https://forgejo.org/) and [Gitea](https://gitea.io/) instances
+  from swamp over their shared `/api/v1` REST surface, authenticated with a
+  personal access token — a read-only swamp node for a self-hosted git forge.
+
+  Every method persists a typed, CEL-referenceable snapshot. Per-repo snapshots
+  are keyed `owner__repo` (single issues/PRs add `__<index>`):
+
+  ```
+  data.latest("forgejo", "shrug__infra").attributes.issues
+  data.latest("forgejo", "neil__aoc2024__12").attributes
+  ```
+
+  ## Methods
+
+  - **list_repos** — repositories accessible to the authenticated user.
+  - **get_repo** — details for one repository.
+  - **list_issues** — issues for a repo (pins `type=issues`, so pull requests
+    are excluded), filterable by `open` / `closed` / `all`.
+  - **get_issue** — a single issue by number.
+  - **list_pulls** — pull requests for a repo, filterable by state.
+  - **get_pull** — a single PR by number (populates `additions` / `deletions` /
+    `changed_files`, which the list endpoint omits).
+  - **list_releases** — releases for a repo.
+
+  ## Security
+
+  - `token` is a **sensitive** global argument — wire it from a vault at
+    model-create time, never inline it.
+  - The token is sent as an `Authorization: token …` header and is never logged.
+
+  ## Quickstart
+
+  ```bash
+  swamp vault put forgejo token           # hidden prompt
+  swamp model create @shrug/forgejo forgejo \
+    --global-arg host=https://git.shrug.pw \
+    --global-arg token='${{ vault.get(forgejo, token) }}'
+
+  swamp model method run forgejo list_repos
+  swamp model method run forgejo list_issues --arg owner=shrug --arg repo=infra
+  ```
+
+  ## Known limitations
+
+  - List methods expose `page` / `limit` but do not auto-paginate.
+  - No rate-limit backoff: a `429` throws immediately.
+  - Read-only: no create/edit/merge/delete paths yet.
+
+repository: https://github.com/shrugpw/swamp-forgejo
+
+paths:
+  base: manifest
+
+models:
+  - forgejo.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+# Empty platforms == universal. The model talks HTTPS to the forge REST API via
+# fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - forgejo
+  - gitea
+  - git
