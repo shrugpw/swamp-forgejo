@@ -287,7 +287,8 @@ const GetRepoArgs = z.object({
   repo: z.string().describe("Repository name."),
 });
 
-const ListIssuesArgs = z.object({
+/** Arguments for `list_issues`: repo ref, `state` filter (default open), pagination. */
+export const ListIssuesArgs = z.object({
   ...RepoRefArgs,
   state: z.enum(["open", "closed", "all"]).default("open").describe(
     "Filter by issue state.",

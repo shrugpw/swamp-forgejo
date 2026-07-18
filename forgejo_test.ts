@@ -13,7 +13,7 @@
 //
 // Run inside swamp's toolchain (where the jsr specifier resolves):
 //   deno test extensions/forgejo/forgejo_test.ts
-import { assert, assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   apiGet,
   GlobalArgsSchema,
@@ -21,6 +21,7 @@ import {
   IssueSchema,
   issuePath,
   issuesPath,
+  ListIssuesArgs,
   model,
   PullRequestSchema,
   pullPath,
@@ -294,6 +295,9 @@ interface WrittenResource {
 
 // Minimal stand-in for the swamp method context. Captures writeResource calls
 // and swallows logs. globalArgs is passed through verbatim (no Zod defaults).
+// Like the real runtime, the fake writeResource validates the written value
+// against the model's declared resource schema — so a method that drops or
+// mis-shapes a written field fails here, not just under the explicit asserts.
 function fakeContext(
   written: WrittenResource[],
   globalArgs: Record<string, unknown> = {
@@ -308,6 +312,9 @@ function fakeContext(
     logger: { info: noop, warn: noop, error: noop, debug: noop },
     // deno-lint-ignore no-explicit-any
     writeResource: (resource: string, instance: string, value: any) => {
+      const res = (model.resources as Record<string, { schema: { parse: (v: unknown) => unknown } }>)[resource];
+      assert(res, `unknown resource "${resource}"`);
+      res.schema.parse(value); // throws if the written shape is wrong
       written.push({ resource, instance, value });
       return Promise.resolve({ resource, instance });
     },
@@ -403,4 +410,96 @@ Deno.test("list_pulls.execute with state=open writes the pulls resource", async 
   } finally {
     mock.restore();
   }
+});
+
+const REPO_SHAPE = {
+  id: 1,
+  name: "infra",
+  full_name: "shrug/infra",
+  description: "",
+  private: false,
+  fork: false,
+  template: false,
+  mirror: false,
+  archived: false,
+  empty: false,
+  html_url: "https://git.shrug.pw/shrug/infra",
+  ssh_url: "git@git.shrug.pw:shrug/infra.git",
+  clone_url: "https://git.shrug.pw/shrug/infra.git",
+  language: "TypeScript",
+  default_branch: "main",
+  stars_count: 0,
+  forks_count: 0,
+  watchers_count: 0,
+  open_issues_count: 0,
+  open_pr_counter: 0,
+  release_counter: 0,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+  owner: USER,
+};
+
+Deno.test("list_repos.execute writes the repos resource at the 'main' instance", async () => {
+  const mock = installMockFetch(() => jsonResponse([REPO_SHAPE]));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.list_repos.execute(
+      { page: 1, limit: 50 },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/user/repos?page=1&limit=50");
+    assertEquals(written[0].resource, "repos");
+    assertEquals(written[0].instance, "main", "list_repos keys the CEL-referenced 'main' instance");
+    assertEquals(written[0].value.count, 1);
+    assertEquals(written[0].value.page, 1);
+    assertEquals(written[0].value.limit, 50);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("get_repo.execute writes RepoSchema at owner__repo", async () => {
+  const mock = installMockFetch(() => jsonResponse(REPO_SHAPE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.get_repo.execute(
+      { owner: "shrug", repo: "infra" },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/shrug/infra");
+    assertEquals(written[0].resource, "repo");
+    assertEquals(written[0].instance, "shrug__infra");
+    assertEquals(written[0].value.full_name, "shrug/infra");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("get_issue.execute writes IssueSchema at owner__repo__index", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.get_issue.execute(
+      { owner: "o", repo: "r", index: 2 },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r/issues/2");
+    assertEquals(written[0].resource, "issue");
+    assertEquals(written[0].instance, "o__r__2");
+    assertEquals(written[0].value.number, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+// The framework applies Zod defaults before calling execute; pin that contract
+// so a change to a default (state/page/limit) can't slip through unnoticed.
+Deno.test("ListIssuesArgs applies state=open, page=1, limit=50 defaults", () => {
+  const parsed = ListIssuesArgs.parse({ owner: "o", repo: "r" });
+  assertEquals(parsed.state, "open");
+  assertEquals(parsed.page, 1);
+  assertEquals(parsed.limit, 50);
 });
