@@ -216,9 +216,16 @@ export function releasesPath(
   return `/repos/${owner}/${repo}/releases?page=${page}&limit=${limit}`;
 }
 
-/** Path for `list_deploy_keys` / `create_deploy_key` (repo deploy-keys collection). */
+/**
+ * Path for `list_deploy_keys` / `create_deploy_key` (repo deploy-keys
+ * collection). Unlike the read-only path builders, `owner`/`repo` are
+ * percent-encoded here: this is the first *write* endpoint (it mints a
+ * persistent SSH access credential), so a crafted segment containing `/`,
+ * `..`, `?`, or `#` must not be able to misdirect key creation to another
+ * repo the PAT can reach. (SEC-1.)
+ */
 export function deployKeysPath(owner: string, repo: string): string {
-  return `/repos/${owner}/${repo}/keys`;
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/keys`;
 }
 
 // Instance names key per-repo (or per-repo-per-number) data snapshots. The `__`

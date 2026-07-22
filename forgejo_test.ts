@@ -183,6 +183,14 @@ Deno.test("deployKeysPath builds the exact deploy-keys collection path", () => {
   assertEquals(deployKeysPath("o", "r"), "/repos/o/r/keys");
 });
 
+Deno.test("deployKeysPath percent-encodes owner/repo so a write can't be misdirected (SEC-1)", () => {
+  // A crafted segment must not escape its path position and redirect the POST
+  // (which mints an SSH credential) to another repo the PAT can reach.
+  assertEquals(deployKeysPath("a/b", "r"), "/repos/a%2Fb/r/keys");
+  assertEquals(deployKeysPath("o", "../evil"), "/repos/o/..%2Fevil/keys");
+  assert(!deployKeysPath("o", "r?x=1#y").includes("?"), "query/fragment chars must be encoded");
+});
+
 Deno.test("instanceName uses the __ separator CEL callers depend on", () => {
   assertEquals(instanceName("shrug", "infra"), "shrug__infra");
   assertEquals(instanceName("neil", "aoc2024", 12), "neil__aoc2024__12");
