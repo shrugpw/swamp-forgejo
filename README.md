@@ -20,6 +20,8 @@ expressions — no re-fetching.
 | `list_pulls` | Pull requests for a repo, filterable by state. |
 | `get_pull` | A single PR by number — populates `additions`/`deletions`/`changed_files`, which the list endpoint omits. |
 | `list_releases` | Releases for a repo. |
+| `list_deploy_keys` | Deploy keys registered on a repo — verify-first before creating one. |
+| `create_deploy_key` | Register a deploy key on a repo. **Defaults to read-only** (least privilege); pass `read_only=false` to opt into write. |
 
 ## Data model
 
@@ -64,8 +66,12 @@ swamp model method run forgejo get_pull   --arg owner=shrug --arg repo=infra --a
 - **Diff stats only on `get_pull`.** `list_pulls` leaves `additions`,
   `deletions`, and `changed_files` `undefined` — the forge only populates them
   on the single-PR endpoint.
-- **Read-only.** No create/edit/merge/delete paths yet. See the model's
-  next-steps notes for the planned CRUD surface.
+- **Mostly read-only.** The only write path is deploy-key registration
+  (`create_deploy_key`); there is no edit/merge/delete surface yet.
+- **`create_deploy_key` is not idempotent.** Each call POSTs a new key; the
+  forge only rejects on exact public-key reuse. Call `list_deploy_keys` first
+  and skip if the key already exists. There is no `delete_deploy_key` — prune
+  stale keys in the Forgejo UI.
 
 ## Development
 

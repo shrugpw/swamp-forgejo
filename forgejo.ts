@@ -133,6 +133,17 @@ export const ReleaseSchema = z.object({
   author: UserSchema,
 });
 
+/** A repository deploy key, as returned by `/repos/{owner}/{repo}/keys`. */
+export const DeployKeySchema = z.object({
+  id: z.number(),
+  key: z.string(),
+  url: z.string(),
+  title: z.string(),
+  fingerprint: z.string(),
+  created_at: z.string(),
+  read_only: z.boolean(),
+});
+
 // ── Global arguments ──────────────────────────────────────────────────────────
 
 /** Model global arguments: the forge `host` URL and a sensitive access `token`. */
@@ -205,6 +216,18 @@ export function releasesPath(
   return `/repos/${owner}/${repo}/releases?page=${page}&limit=${limit}`;
 }
 
+/**
+ * Path for `list_deploy_keys` / `create_deploy_key` (repo deploy-keys
+ * collection). Unlike the read-only path builders, `owner`/`repo` are
+ * percent-encoded here: this is the first *write* endpoint (it mints a
+ * persistent SSH access credential), so a crafted segment containing `/`,
+ * `..`, `?`, or `#` must not be able to misdirect key creation to another
+ * repo the PAT can reach. (SEC-1.)
+ */
+export function deployKeysPath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/keys`;
+}
+
 // Instance names key per-repo (or per-repo-per-number) data snapshots. The `__`
 // separator is what CEL callers reference:
 //   data.latest("forgejo", "owner__repo").attributes.issues
@@ -238,6 +261,32 @@ export async function apiGet(
     const body = await resp.text();
     throw new Error(
       `Forgejo/Gitea API error ${resp.status} on GET ${path}: ${body}`,
+    );
+  }
+  return resp.json();
+}
+
+/** Authenticated POST against `{host}/api/v1{path}` with a JSON body. Throws with status + body on any non-2xx. */
+export async function apiPost(
+  host: string,
+  token: string,
+  path: string,
+  body: unknown,
+): Promise<unknown> {
+  const url = `${host.replace(/\/$/, "")}/api/v1${path}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(
+      `Forgejo/Gitea API error ${resp.status} on POST ${path}: ${body}`,
     );
   }
   return resp.json();
@@ -316,6 +365,19 @@ const GetPullArgs = z.object({
 
 const ListReleasesArgs = z.object({ ...RepoRefArgs, ...PageArgs });
 
+const ListDeployKeysArgs = z.object({ ...RepoRefArgs });
+
+export const CreateDeployKeyArgs = z.object({
+  ...RepoRefArgs,
+  title: z.string().min(1).describe("Human-readable label for the deploy key."),
+  key: z.string().min(1).describe(
+    "Public key material, e.g. 'ssh-ed25519 AAAA...'.",
+  ),
+  read_only: z.boolean().default(true).describe(
+    "Grant read-only access (true, default) or read/write (false).",
+  ),
+});
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /** The `@shrug/forgejo` model: read-only queries over the Forgejo/Gitea `/api/v1` REST surface. */
@@ -392,6 +454,23 @@ export const model = {
         page: z.number(),
         limit: z.number(),
       }),
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    deploy_keys: {
+      description: "Deploy keys registered on a repository",
+      schema: z.object({
+        keys: z.array(DeployKeySchema),
+        count: z.number(),
+        owner: z.string(),
+        repo: z.string(),
+      }),
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    deploy_key: {
+      description: "A single deploy key created on a repository",
+      schema: DeployKeySchema,
       lifetime: "1h",
       garbageCollection: 5,
     },
@@ -664,6 +743,83 @@ export const model = {
           count: releases.length,
           owner: args.owner,
           repo: args.repo,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_deploy_keys: {
+      description:
+        "List deploy keys registered on a repository (verify-first before create).",
+      arguments: ListDeployKeysArgs,
+      execute: async (
+        args: z.infer<typeof ListDeployKeysArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        context.logger.info("Listing deploy keys for {owner}/{repo}", {
+          owner: args.owner,
+          repo: args.repo,
+        });
+
+        const data = await apiGet(
+          host,
+          token,
+          deployKeysPath(args.owner, args.repo),
+        );
+
+        const keys = z.array(DeployKeySchema).parse(data);
+        const handle = await context.writeResource(
+          "deploy_keys",
+          instanceName(args.owner, args.repo),
+          { keys, count: keys.length, owner: args.owner, repo: args.repo },
+        );
+
+        context.logger.info("Fetched {count} deploy keys for {owner}/{repo}", {
+          count: keys.length,
+          owner: args.owner,
+          repo: args.repo,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_deploy_key: {
+      description:
+        "Register a deploy key on a repository. Defaults to read-only (least privilege).",
+      arguments: CreateDeployKeyArgs,
+      execute: async (
+        args: z.infer<typeof CreateDeployKeyArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        context.logger.info(
+          "Creating {mode} deploy key {title} on {owner}/{repo}",
+          {
+            mode: args.read_only ? "read-only" : "read/write",
+            title: args.title,
+            owner: args.owner,
+            repo: args.repo,
+          },
+        );
+
+        const data = await apiPost(
+          host,
+          token,
+          deployKeysPath(args.owner, args.repo),
+          { title: args.title, key: args.key, read_only: args.read_only },
+        );
+
+        const key = DeployKeySchema.parse(data);
+        const handle = await context.writeResource(
+          "deploy_key",
+          instanceName(args.owner, args.repo, key.id),
+          key,
+        );
+
+        context.logger.info("Created deploy key #{id} ({fingerprint})", {
+          id: key.id,
+          fingerprint: key.fingerprint,
         });
         return { dataHandles: [handle] };
       },

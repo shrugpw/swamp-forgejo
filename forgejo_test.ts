@@ -16,6 +16,10 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   apiGet,
+  apiPost,
+  CreateDeployKeyArgs,
+  DeployKeySchema,
+  deployKeysPath,
   GlobalArgsSchema,
   instanceName,
   IssueSchema,
@@ -37,11 +41,13 @@ import {
 interface RecordedFetch {
   url: string;
   headers: Record<string, string>;
+  method?: string;
+  body?: string;
 }
 
 // Install a fake global fetch. `handler(url)` returns the Response for each
-// call. Records every request's URL + headers. Returns a restore fn (call in a
-// finally).
+// call. Records every request's URL + headers (and method/body, for POST
+// assertions). Returns a restore fn (call in a finally).
 function installMockFetch(
   handler: (url: string) => Response,
 ): { calls: RecordedFetch[]; restore: () => void } {
@@ -52,7 +58,12 @@ function installMockFetch(
     const headers: Record<string, string> = {};
     const h = init?.headers as Record<string, string> | undefined;
     if (h) for (const [k, v] of Object.entries(h)) headers[k] = v;
-    calls.push({ url, headers });
+    calls.push({
+      url,
+      headers,
+      method: init?.method,
+      body: init?.body as string | undefined,
+    });
     return Promise.resolve(handler(url));
   }) as typeof fetch;
   return { calls, restore: () => void (globalThis.fetch = orig) };
@@ -128,6 +139,16 @@ const ISSUE = {
   closed_at: "2026-04-02T00:00:00Z",
 };
 
+const DEPLOY_KEY = {
+  id: 7,
+  key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... swamp-serve-01",
+  url: "https://git.shrug.pw/api/v1/repos/shrugpw/swamp/keys/7",
+  title: "swamp-serve-01",
+  fingerprint: "SHA256:abc123",
+  created_at: "2026-07-22T00:00:00Z",
+  read_only: true,
+};
+
 // ── 1. path builders (pure) ───────────────────────────────────────────────────
 
 Deno.test("issuesPath pins type=issues so PRs are excluded", () => {
@@ -156,6 +177,18 @@ Deno.test("remaining path builders are exact", () => {
   assertEquals(issuePath("o", "r", 7), "/repos/o/r/issues/7");
   assertEquals(pullPath("o", "r", 9), "/repos/o/r/pulls/9");
   assertEquals(releasesPath("o", "r", 1, 50), "/repos/o/r/releases?page=1&limit=50");
+});
+
+Deno.test("deployKeysPath builds the exact deploy-keys collection path", () => {
+  assertEquals(deployKeysPath("o", "r"), "/repos/o/r/keys");
+});
+
+Deno.test("deployKeysPath percent-encodes owner/repo so a write can't be misdirected (SEC-1)", () => {
+  // A crafted segment must not escape its path position and redirect the POST
+  // (which mints an SSH credential) to another repo the PAT can reach.
+  assertEquals(deployKeysPath("a/b", "r"), "/repos/a%2Fb/r/keys");
+  assertEquals(deployKeysPath("o", "../evil"), "/repos/o/..%2Fevil/keys");
+  assert(!deployKeysPath("o", "r?x=1#y").includes("?"), "query/fragment chars must be encoded");
 });
 
 Deno.test("instanceName uses the __ separator CEL callers depend on", () => {
@@ -241,6 +274,31 @@ Deno.test("RepoSchema: language is nullable", () => {
   assert(RepoSchema.safeParse({ ...base, language: "TypeScript" }).success);
 });
 
+Deno.test("DeployKeySchema parses the fixture and strips unknown fields", () => {
+  const key = DeployKeySchema.parse({
+    ...DEPLOY_KEY,
+    key_id: 99,
+    repository: { id: 1, full_name: "shrugpw/swamp" },
+  });
+  assertEquals(key.id, 7);
+  assertEquals(key.fingerprint, "SHA256:abc123");
+  assertEquals(key.read_only, true);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((key as any).key_id, undefined, "unknown fields must be stripped");
+  // deno-lint-ignore no-explicit-any
+  assertEquals((key as any).repository, undefined, "unknown fields must be stripped");
+});
+
+Deno.test("CreateDeployKeyArgs defaults read_only to true when omitted", () => {
+  const parsed = CreateDeployKeyArgs.parse({
+    owner: "o",
+    repo: "r",
+    title: "t",
+    key: "ssh-ed25519 AAAA...",
+  });
+  assertEquals(parsed.read_only, true);
+});
+
 // ── 3. apiGet (mocked fetch) ──────────────────────────────────────────────────
 
 Deno.test("apiGet builds /api/v1 URL, strips trailing host slash, sends token auth", async () => {
@@ -279,6 +337,45 @@ Deno.test("apiGet throws on 500 and includes the body text", async () => {
     );
     assert(err.message.includes("500"));
     assert(err.message.includes("boom"), "body text should be surfaced");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("apiPost builds /api/v1 URL, strips trailing host slash, sends token auth + JSON body", async () => {
+  const mock = installMockFetch(() => jsonResponse({ ok: true }));
+  try {
+    const body = { title: "t", key: "ssh-ed25519 AAAA...", read_only: true };
+    const out = await apiPost(
+      "https://git.shrug.pw/",
+      "s3cr3t",
+      "/repos/o/r/keys",
+      body,
+    );
+    assertEquals(mock.calls.length, 1);
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r/keys");
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(mock.calls[0].headers.Authorization, "token s3cr3t");
+    assertEquals(mock.calls[0].headers.Accept, "application/json");
+    assertEquals(mock.calls[0].headers["Content-Type"], "application/json");
+    assertEquals(mock.calls[0].body, JSON.stringify(body));
+    assertEquals(out, { ok: true });
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("apiPost throws on 422 with status + body", async () => {
+  const mock = installMockFetch(() =>
+    new Response("key already in use", { status: 422 })
+  );
+  try {
+    const err = await assertRejects(
+      () => apiPost("https://git.shrug.pw", "t", "/repos/o/r/keys", {}),
+      Error,
+      "422",
+    );
+    assert(err.message.includes("key already in use"), "body text should be surfaced");
   } finally {
     mock.restore();
   }
@@ -502,4 +599,85 @@ Deno.test("ListIssuesArgs applies state=open, page=1, limit=50 defaults", () => 
   assertEquals(parsed.state, "open");
   assertEquals(parsed.page, 1);
   assertEquals(parsed.limit, 50);
+});
+
+Deno.test("list_deploy_keys.execute GETs the keys collection and writes owner__repo", async () => {
+  const mock = installMockFetch(() => jsonResponse([DEPLOY_KEY]));
+  const written: WrittenResource[] = [];
+  try {
+    const res = await model.methods.list_deploy_keys.execute(
+      { owner: "o", repo: "r" },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r/keys");
+    assertEquals(written.length, 1);
+    assertEquals(written[0].resource, "deploy_keys");
+    assertEquals(written[0].instance, "o__r");
+    assertEquals(written[0].value.count, 1);
+    assertEquals(res.dataHandles.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_deploy_key.execute POSTs the body and writes owner__repo__id", async () => {
+  const mock = installMockFetch(() => jsonResponse(DEPLOY_KEY));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_deploy_key.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "swamp-serve-01",
+        key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... swamp-serve-01",
+        read_only: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r/keys");
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].body,
+      JSON.stringify({
+        title: "swamp-serve-01",
+        key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... swamp-serve-01",
+        read_only: true,
+      }),
+    );
+    assertEquals(written[0].resource, "deploy_key");
+    assertEquals(written[0].instance, "o__r__7");
+    assertEquals(written[0].value.read_only, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_deploy_key surfaces an API error instead of writing a resource", async () => {
+  const mock = installMockFetch(() =>
+    new Response("key already in use", { status: 422 })
+  );
+  const written: WrittenResource[] = [];
+  try {
+    await assertRejects(
+      () =>
+        model.methods.create_deploy_key.execute(
+          {
+            owner: "o",
+            repo: "r",
+            title: "dup",
+            key: "ssh-ed25519 AAAA...",
+            read_only: true,
+          },
+          // deno-lint-ignore no-explicit-any
+          fakeContext(written) as any,
+        ),
+      Error,
+      "422",
+    );
+    assertEquals(written.length, 0, "no resource should be written on failure");
+  } finally {
+    mock.restore();
+  }
 });
