@@ -378,6 +378,21 @@ export const CreateDeployKeyArgs = z.object({
   ),
 });
 
+export const CreateRepoArgs = z.object({
+  name: z.string().min(1).describe("Repository name."),
+  description: z.string().default("").describe("Repository description."),
+  private: z.boolean().default(false).describe(
+    "Whether the repository is private (default false — public, anonymously cloneable).",
+  ),
+  auto_init: z.boolean().default(false).describe(
+    "Initialize with an initial commit (README). Leave false to push an existing history.",
+  ),
+  default_branch: z.string().default("main").describe("Default branch name."),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to create the repository — this is a live mutation.",
+  ),
+});
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /** The `@shrug/forgejo` model: read-only queries over the Forgejo/Gitea `/api/v1` REST surface. */
@@ -820,6 +835,49 @@ export const model = {
         context.logger.info("Created deploy key #{id} ({fingerprint})", {
           id: key.id,
           fingerprint: key.fingerprint,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_repo: {
+      description:
+        "Create a repository owned by the authenticated user (POST /user/repos). Confirm-gated (a live mutation). Push existing history afterwards, or set auto_init to seed an initial commit.",
+      arguments: CreateRepoArgs,
+      execute: async (
+        args: z.infer<typeof CreateRepoArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to create repository without confirm:true (a live mutation).",
+          );
+        }
+        context.logger.info("Creating {vis} repo {name} on {host}", {
+          vis: args.private ? "private" : "public",
+          name: args.name,
+          host,
+        });
+
+        const data = await apiPost(host, token, "/user/repos", {
+          name: args.name,
+          description: args.description,
+          private: args.private,
+          auto_init: args.auto_init,
+          default_branch: args.default_branch,
+        });
+
+        const repo = RepoSchema.parse(data);
+        const handle = await context.writeResource(
+          "repo",
+          instanceName(repo.owner.login, repo.name),
+          repo,
+        );
+
+        context.logger.info("Created repo {full_name} ({clone_url})", {
+          full_name: repo.full_name,
+          clone_url: repo.clone_url,
         });
         return { dataHandles: [handle] };
       },
