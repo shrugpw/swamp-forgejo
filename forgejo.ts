@@ -156,6 +156,8 @@ export const OrgSchema = z.object({
   description: z.string(),
   visibility: z.string(),
   avatar_url: z.string(),
+}).refine((o) => o.username !== undefined || o.name !== undefined, {
+  message: "org must carry at least one of `username` or `name`",
 });
 
 /** A team within an organization. `permission` may be read/write/admin/owner/none. */
@@ -164,6 +166,7 @@ export const TeamSchema = z.object({
   name: z.string(),
   description: z.string(),
   permission: z.string(),
+  units: z.array(z.string()).optional(),
 });
 
 /** A comment on an issue or pull request. */
@@ -381,9 +384,17 @@ export function instanceName(
  * Join arbitrary instance-name segments with the same `__` separator
  * `instanceName` uses, for keys with more parts than owner/repo/index
  * (e.g. `collaborator@owner__repo__username`, `issue_comment@owner__repo__index__id`).
+ *
+ * Each segment is collision-safe: it is percent-encoded *and* its underscores are
+ * escaped to `%5F` before joining. Without escaping underscores, a segment
+ * containing `__` would blur the segment boundary, so e.g. `('a','b__c','d')`
+ * and `('a__b','c','d')` would collide on the same key and corrupt each other's
+ * snapshots. (CORR-1.)
  */
 export function instanceKey(...parts: (string | number)[]): string {
-  return parts.join("__");
+  return parts
+    .map((p) => encodeURIComponent(String(p)).replaceAll("_", "%5F"))
+    .join("__");
 }
 
 // ── API helper ────────────────────────────────────────────────────────────────

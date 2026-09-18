@@ -15,6 +15,7 @@
 //   deno test extensions/forgejo/forgejo_test.ts
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
+  AddCollaboratorArgs,
   apiDelete,
   apiGet,
   apiPatch,
@@ -844,6 +845,18 @@ Deno.test("instanceKey joins arbitrary segments with the __ separator", () => {
   assertEquals(instanceKey(4, "neil"), "4__neil");
 });
 
+Deno.test("instanceKey escapes segments so `__` inside a segment can't collide (CORR-1)", () => {
+  // Without per-segment escaping these two distinct keys would both flatten to
+  // "a__b__c__d" and corrupt each other's snapshots.
+  assert(
+    instanceKey("a", "b__c", "d") !== instanceKey("a__b", "c", "d"),
+    "a segment containing `__` must not collide with a different segmentation",
+  );
+  // The `__` inside a segment survives as escaped underscores, not a boundary.
+  assertEquals(instanceKey("a", "b__c", "d"), "a__b%5F%5Fc__d");
+  assertEquals(instanceKey("a__b", "c", "d"), "a%5F%5Fb__c__d");
+});
+
 // ── 7. write-ops: schemas ─────────────────────────────────────────────────────
 
 Deno.test("OrgSchema parses and strips extras", () => {
@@ -855,10 +868,37 @@ Deno.test("OrgSchema parses and strips extras", () => {
   assertEquals((org as any).website, undefined, "extras stripped");
 });
 
-Deno.test("TeamSchema parses", () => {
-  const team = TeamSchema.parse({ ...TEAM, units: ["repo.code"] });
+Deno.test("OrgSchema parses with only `username` (no `name`)", () => {
+  const org = OrgSchema.parse({ ...ORG, name: undefined });
+  assertEquals(org.username, "shrugpw");
+  assertEquals(org.name, undefined);
+});
+
+Deno.test("OrgSchema parses with only `name` (no `username`)", () => {
+  const org = OrgSchema.parse({ ...ORG, username: undefined });
+  assertEquals(org.name, "shrugpw");
+  assertEquals(org.username, undefined);
+});
+
+Deno.test("OrgSchema rejects a payload with neither username nor name (TEST-2)", () => {
+  const { username: _u, name: _n, ...rest } = ORG;
+  assert(
+    !OrgSchema.safeParse(rest).success,
+    "an org with neither username nor name must not parse",
+  );
+});
+
+Deno.test("TeamSchema parses and retains an optional units array (SPEC-1)", () => {
+  const team = TeamSchema.parse({
+    ...TEAM,
+    units: ["repo.code", "repo.issues"],
+  });
   assertEquals(team.id, 4);
   assertEquals(team.permission, "owner");
+  assertEquals(team.units, ["repo.code", "repo.issues"]);
+  // units is optional: a team object without it still parses
+  const bare = TeamSchema.parse(TEAM);
+  assertEquals(bare.units, undefined);
 });
 
 Deno.test("CommentSchema parses with an embedded user", () => {
@@ -872,6 +912,15 @@ Deno.test("CollaboratorPermission accepts read/write/admin only", () => {
   assert(CollaboratorPermission.safeParse("write").success);
   assert(CollaboratorPermission.safeParse("admin").success);
   assert(!CollaboratorPermission.safeParse("owner").success);
+});
+
+Deno.test("AddCollaboratorArgs defaults permission to write (least privilege) (TEST-1)", () => {
+  const parsed = AddCollaboratorArgs.parse({
+    owner: "o",
+    repo: "r",
+    username: "neil",
+  });
+  assertEquals(parsed.permission, "write");
 });
 
 // ── 8. write-ops: API helpers (mocked fetch) ──────────────────────────────────
@@ -1506,6 +1555,109 @@ Deno.test("create_issue_comment POSTs {body} and writes issue_comment@owner__rep
     assertEquals(written[0].resource, "issue_comment");
     assertEquals(written[0].instance, "o__r__2__11");
     assertEquals(written[0].value.id, 11);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ── 13b. write-ops: hostile-segment encoding, end-to-end (SEC-1 / TEST-3) ─────
+// Each remaining mutating method must route its caller-supplied segments through
+// the percent-encoding path builder so a crafted segment (`a/b`) can't escape
+// its position and misdirect the live mutation.
+
+Deno.test("create_org_repo percent-encodes a hostile org segment (TEST-3)", async () => {
+  const mock = installMockFetch(() => jsonResponse(REPO_SHAPE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_org_repo.execute(
+      {
+        org: "a/b",
+        name: "infra",
+        description: "",
+        private: true,
+        auto_init: false,
+        default_branch: "main",
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/orgs/a%2Fb/repos",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("add_org_team_member percent-encodes a hostile username segment (TEST-3)", async () => {
+  const mock = installMockFetch(() => emptyResponse(204));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.add_org_team_member.execute(
+      { team_id: 4, username: "a/b", confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/teams/4/members/a%2Fb",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_issue percent-encodes a hostile owner segment (TEST-3)", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_issue.execute(
+      { owner: "a/b", repo: "r", title: "Bug", body: "", confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue percent-encodes a hostile owner segment (TEST-3)", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      { owner: "a/b", repo: "r", index: 2, state: "closed", confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues/2",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_issue_comment percent-encodes a hostile owner segment (TEST-3)", async () => {
+  const mock = installMockFetch(() => jsonResponse(COMMENT));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_issue_comment.execute(
+      { owner: "a/b", repo: "r", index: 2, body: "hi", confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues/2/comments",
+    );
   } finally {
     mock.restore();
   }
