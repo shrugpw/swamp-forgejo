@@ -366,6 +366,15 @@ export function issueCommentsPath(
   }/issues/${encodeURIComponent(String(index))}/comments`;
 }
 
+/**
+ * Path for `create_user` (the site-admin user-provisioning collection). Takes no
+ * caller-supplied segments, so there is nothing to encode: the username/email are
+ * carried in the POST body, not the URL.
+ */
+export function adminUsersPath(): string {
+  return `/admin/users`;
+}
+
 // Instance names key per-repo (or per-repo-per-number) data snapshots. The `__`
 // separator is what CEL callers reference:
 //   data.latest("forgejo", "owner__repo").attributes.issues
@@ -759,6 +768,27 @@ export const CreateIssueCommentArgs = z.object({
   body: z.string().min(1).describe("Comment body (markdown)."),
   confirm: z.boolean().default(false).describe(
     "Must be true to create the comment — this is a live mutation.",
+  ),
+});
+
+export const CreateUserArgs = z.object({
+  username: z.string().min(1).describe("Login for the new account."),
+  email: z.string().describe("Email address for the new account."),
+  password: z.string().meta({ sensitive: true }).describe(
+    "Initial password for the new account. Sensitive — never logged.",
+  ),
+  must_change_password: z.boolean().default(true).describe(
+    "Force a password change on first sign-in (default true).",
+  ),
+  restricted: z.boolean().default(false).describe(
+    "Create the account as restricted (default false).",
+  ),
+  visibility: z.enum(["public", "limited", "private"]).default("private")
+    .describe(
+      "Account visibility (default private — least privilege).",
+    ),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to create the user — this is a live mutation.",
   ),
 });
 
@@ -1849,6 +1879,44 @@ export const model = {
           id: comment.id,
           index: args.index,
         });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_user: {
+      description:
+        "Create a normal user account (POST /admin/users). Requires the model's token to have SITE-ADMIN privileges; the created account is a normal (non-admin) user. Defaults to least privilege: must_change_password=true, restricted=false, visibility=private. Confirm-gated (a live mutation).",
+      arguments: CreateUserArgs,
+      execute: async (
+        args: z.infer<typeof CreateUserArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to create user without confirm:true (a live mutation).",
+          );
+        }
+        context.logger.info("Creating {vis} user {username} on {host}", {
+          vis: args.visibility,
+          username: args.username,
+          host,
+        });
+
+        const data = await apiPost(host, token, adminUsersPath(), {
+          username: args.username,
+          email: args.email,
+          password: args.password,
+          must_change_password: args.must_change_password,
+          restricted: args.restricted,
+          visibility: args.visibility,
+        });
+
+        const user = UserSchema.parse(data);
+        // key off the server-assigned login (get_user keys off the input arg; both target the `user` resource)
+        const handle = await context.writeResource("user", user.login, user);
+
+        context.logger.info("Created user {login}", { login: user.login });
         return { dataHandles: [handle] };
       },
     },
