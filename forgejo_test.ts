@@ -16,6 +16,7 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   AddCollaboratorArgs,
+  adminUsersPath,
   apiDelete,
   apiGet,
   apiPatch,
@@ -26,6 +27,7 @@ import {
   collaboratorsPath,
   CommentSchema,
   CreateDeployKeyArgs,
+  CreateUserArgs,
   DeployKeySchema,
   deployKeysPath,
   GlobalArgsSchema,
@@ -54,6 +56,7 @@ import {
   TeamSchema,
   userPath,
   userReposPath,
+  UserSchema,
 } from "./forgejo.ts";
 
 // ── fetch interception ────────────────────────────────────────────────────────
@@ -1686,6 +1689,126 @@ Deno.test("a confirmed write method surfaces an API error instead of writing", a
       "403",
     );
     assertEquals(written.length, 0, "no snapshot written on API failure");
+  } finally {
+    mock.restore();
+  }
+});
+
+// ── 14. admin: create_user (site-admin, mocked fetch) ─────────────────────────
+
+// A user account as returned by POST /admin/users.
+const ADMIN_USER = {
+  id: 12,
+  login: "label",
+  full_name: "Louis Abel",
+  email: "label@example.com",
+  html_url: "https://git.shrug.pw/label",
+  avatar_url: "https://git.shrug.pw/avatars/12",
+};
+
+Deno.test("adminUsersPath builds the exact /admin/users collection path", () => {
+  assertEquals(adminUsersPath(), "/admin/users");
+});
+
+Deno.test("CreateUserArgs applies least-privilege defaults", () => {
+  const parsed = CreateUserArgs.parse({
+    username: "label",
+    email: "label@example.com",
+    password: "s3cr3t",
+  });
+  assertEquals(parsed.must_change_password, true);
+  assertEquals(parsed.admin, false);
+  assertEquals(parsed.restricted, false);
+  assertEquals(parsed.visibility, "private");
+  assertEquals(parsed.confirm, false);
+});
+
+Deno.test("CreateUserArgs marks the password sensitive", () => {
+  // deno-lint-ignore no-explicit-any
+  const meta = (CreateUserArgs.shape.password as any).meta?.();
+  assertEquals(
+    meta?.sensitive,
+    true,
+    "password must carry sensitive:true metadata",
+  );
+});
+
+Deno.test("UserSchema parses an admin-created user response and strips extras", () => {
+  const user = UserSchema.parse({
+    ...ADMIN_USER,
+    is_admin: true,
+    restricted: false,
+    created: "2026-09-19T00:00:00Z",
+  });
+  assertEquals(user.id, 12);
+  assertEquals(user.login, "label");
+  assertEquals(user.email, "label@example.com");
+  // deno-lint-ignore no-explicit-any
+  assertEquals((user as any).is_admin, undefined, "unknown fields stripped");
+});
+
+Deno.test("create_user POSTs /admin/users with defaults applied and writes user@{username}", async () => {
+  const mock = installMockFetch(() => jsonResponse(ADMIN_USER));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_user.execute(
+      CreateUserArgs.parse({
+        username: "label",
+        email: "label@example.com",
+        password: "s3cr3t",
+        confirm: true,
+      }),
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.shrug.pw/api/v1/admin/users",
+    );
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].body,
+      JSON.stringify({
+        username: "label",
+        email: "label@example.com",
+        password: "s3cr3t",
+        must_change_password: true,
+        admin: false,
+        restricted: false,
+        visibility: "private",
+      }),
+      "body carries username/email/password plus the applied least-privilege defaults",
+    );
+    assertEquals(written[0].resource, "user");
+    assertEquals(written[0].instance, "label", "keyed by the created login");
+    assertEquals(written[0].value.login, "label");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_user refuses without confirm:true (no fetch, no write)", async () => {
+  const mock = installMockFetch(() => {
+    throw new Error("fetch must not be called without confirm");
+  });
+  const written: WrittenResource[] = [];
+  try {
+    await assertRejects(
+      () =>
+        model.methods.create_user.execute(
+          CreateUserArgs.parse({
+            username: "label",
+            email: "label@example.com",
+            password: "s3cr3t",
+          }),
+          // deno-lint-ignore no-explicit-any
+          fakeContext(written) as any,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.calls.length, 0, "create_user must not fetch");
+    assertEquals(written.length, 0, "create_user must not write");
   } finally {
     mock.restore();
   }
