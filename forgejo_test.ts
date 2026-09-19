@@ -1717,7 +1717,6 @@ Deno.test("CreateUserArgs applies least-privilege defaults", () => {
     password: "s3cr3t",
   });
   assertEquals(parsed.must_change_password, true);
-  assertEquals(parsed.admin, false);
   assertEquals(parsed.restricted, false);
   assertEquals(parsed.visibility, "private");
   assertEquals(parsed.confirm, false);
@@ -1773,7 +1772,6 @@ Deno.test("create_user POSTs /admin/users with defaults applied and writes user@
         email: "label@example.com",
         password: "s3cr3t",
         must_change_password: true,
-        admin: false,
         restricted: false,
         visibility: "private",
       }),

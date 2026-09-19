@@ -780,9 +780,6 @@ export const CreateUserArgs = z.object({
   must_change_password: z.boolean().default(true).describe(
     "Force a password change on first sign-in (default true).",
   ),
-  admin: z.boolean().default(false).describe(
-    "Grant site-admin privileges (default false — least privilege).",
-  ),
   restricted: z.boolean().default(false).describe(
     "Create the account as restricted (default false).",
   ),
@@ -1888,7 +1885,7 @@ export const model = {
 
     create_user: {
       description:
-        "Create a user account (POST /admin/users). Requires the model's token to have SITE-ADMIN privileges. Defaults to least privilege: must_change_password=true, admin=false, visibility=private. Confirm-gated (a live mutation).",
+        "Create a normal user account (POST /admin/users). Requires the model's token to have SITE-ADMIN privileges; the created account is a normal (non-admin) user. Defaults to least privilege: must_change_password=true, restricted=false, visibility=private. Confirm-gated (a live mutation).",
       arguments: CreateUserArgs,
       execute: async (
         args: z.infer<typeof CreateUserArgs>,
@@ -1911,12 +1908,12 @@ export const model = {
           email: args.email,
           password: args.password,
           must_change_password: args.must_change_password,
-          admin: args.admin,
           restricted: args.restricted,
           visibility: args.visibility,
         });
 
         const user = UserSchema.parse(data);
+        // key off the server-assigned login (get_user keys off the input arg; both target the `user` resource)
         const handle = await context.writeResource("user", user.login, user);
 
         context.logger.info("Created user {login}", { login: user.login });
