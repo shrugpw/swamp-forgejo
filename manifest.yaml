@@ -1,56 +1,73 @@
 manifestVersion: 1
 name: "@shrug/forgejo"
-version: "2026.07.17.1"
+version: "2026.09.29.1"
 description: |
-  Query [Forgejo](https://forgejo.org/) and [Gitea](https://gitea.io/) instances
+  Drive [Forgejo](https://forgejo.org/) and [Gitea](https://gitea.io/) instances
   from swamp over their shared `/api/v1` REST surface, authenticated with a
-  personal access token — a read-only swamp node for a self-hosted git forge.
+  personal access token — a swamp node for a self-hosted git forge with read and
+  confirm-gated write paths.
 
   Every method persists a typed, CEL-referenceable snapshot. Per-repo snapshots
   are keyed `owner__repo` (single issues/PRs add `__<index>`):
 
   ```
-  data.latest("forgejo", "shrug__infra").attributes.issues
-  data.latest("forgejo", "neil__aoc2024__12").attributes
+  data.latest("forgejo", "acme__infra").attributes.issues
+  data.latest("forgejo", "testuser__demo__12").attributes
   ```
 
   ## Methods
 
-  - **list_repos** — repositories accessible to the authenticated user.
-  - **get_repo** — details for one repository.
-  - **list_issues** — issues for a repo (pins `type=issues`, so pull requests
-    are excluded), filterable by `open` / `closed` / `all`.
-  - **get_issue** — a single issue by number.
-  - **list_pulls** — pull requests for a repo, filterable by state.
-  - **get_pull** — a single PR by number (populates `additions` / `deletions` /
-    `changed_files`, which the list endpoint omits).
-  - **list_releases** — releases for a repo.
+  Read: **list_repos**, **get_repo**, **list_issues** (pins `type=issues`, so
+  pull requests are excluded; filter `open`/`closed`/`all`), **get_issue**,
+  **list_pulls**, **get_pull** (populates `additions`/`deletions`/`changed_files`
+  the list endpoint omits), **list_releases**, **list_deploy_keys**,
+  **list_orgs**, **list_org_repos**, **list_org_teams**, **list_collaborators**,
+  **get_user**, **list_labels** (excludes org-level labels), **list_milestones**.
+
+  Write (all confirm-gated): **create_repo**, **create_org_repo**, **edit_repo**,
+  **delete_repo**, **create_deploy_key**, **add_collaborator**,
+  **remove_collaborator**, **add_org_team_member**, **create_issue** (`labels`
+  are numeric IDs; `milestone` is a numeric ID), **edit_issue** (`milestone` set
+  / `clear_milestone` unset; `assignees` replace/clear), **create_issue_comment**,
+  **add_issue_labels**,
+  **create_label**, **create_milestone**, **create_user** (site-admin token).
+
+  Label names and milestone titles are not unique in Forgejo/Gitea, and the
+  issue API expects label/milestone **IDs** — resolve IDs from a `list_labels` /
+  `list_milestones` snapshot via CEL before creating/associating.
 
   ## Security
 
   - `token` is a **sensitive** global argument — wire it from a vault at
     model-create time, never inline it.
   - The token is sent as an `Authorization: token …` header and is never logged.
+  - Every mutating method is **confirm-gated** (`confirm=true` required) and
+    every caller-supplied path segment is percent-encoded.
 
   ## Quickstart
 
   ```bash
   swamp vault put forgejo token           # hidden prompt
   swamp model create @shrug/forgejo forgejo \
-    --global-arg host=https://git.shrug.pw \
+    --global-arg host=https://git.example.org \
     --global-arg token='${{ vault.get(forgejo, token) }}'
 
   swamp model method run forgejo list_repos
-  swamp model method run forgejo list_issues --arg owner=shrug --arg repo=infra
+  swamp model method run forgejo list_issues --arg owner=acme --arg repo=infra
   ```
 
   ## Known limitations
 
   - List methods expose `page` / `limit` but do not auto-paginate.
   - No rate-limit backoff: a `429` throws immediately.
-  - Read-only: no create/edit/merge/delete paths yet.
+  - No Projects API: Gitea 1.27.x exposes no `/projects` surface, so no
+    project/board method ships.
+  - Bare creates (`create_deploy_key`/`create_label`/`create_milestone`) are not
+    idempotent — verify-first with the matching `list_*` (the caller's job).
+  - No PR merge path (`create_pull`/`merge_pull`) yet; no label/milestone
+    edit/delete surface yet.
 
-repository: https://github.com/shrugpw/swamp-forgejo
+repository: https://github.com/acme/swamp-forgejo
 
 paths:
   base: manifest

@@ -1,7 +1,34 @@
 # @shrug/forgejo — Next Steps
 
-Published: `2026.04.13.1`  
-Covers: read-only queries (repos, issues, PRs, releases)
+Local: `2026.09.29.1` (unpublished)
+Covers: read queries + confirm-gated writes (repos, deploy keys, collaborators,
+teams, issues/comments, users, **labels**, **milestones**, issue label/milestone/
+assignee association).
+
+## Added in 2026.09.29.1
+
+- **Surface issue milestone + assignees.** `IssueSchema` now includes `milestone`
+  (nullable) and `assignees` (array) — previously stripped, which made a
+  successful milestone/assignee association look like a no-op in snapshots even
+  though the forge attached it. Applied on create_issue/edit_issue/get_issue/
+  list_issues (with embedded-milestone date-sentinel normalization).
+- **`edit_issue` assignees.** New `assignees` input (array<string>): omit to
+  leave unchanged, `[]` to clear, `[names]` to replace — matching Gitea's
+  EditIssueOption. (create_issue already supported assignees.)
+
+## Shipped in 2026.09.28.1 (superseded by 2026.09.29.1; never published)
+
+- **Labels:** `list_labels`, `create_label` (bare confirm-gated create; anchored
+  hex color; driver verifies-first).
+- **Milestones:** `list_milestones`, `create_milestone` (bare confirm-gated;
+  ISO-8601 `due_on`; zero-time sentinel normalized to `null`).
+- **Association:** numeric `milestone` on `create_issue`; `milestone` /
+  `clear_milestone` tri-state on `edit_issue`; new `add_issue_labels` for
+  existing issues. `create_issue.labels` stays numeric IDs (resolve via CEL from
+  a `list_labels` snapshot — no in-method name resolution).
+- **Projects:** NOT shipped. This instance reports Gitea-compat **1.27.3**, whose
+  swagger exposes **no `/projects` API** (verified: zero matching paths). Manage
+  boards in the UI. Revisit if the forge later exposes the projects surface.
 
 ---
 
@@ -88,8 +115,8 @@ Useful for registering swamp workflows as Gitea webhook receivers.
 - **Instance names use `__` as separator.** CEL expressions reference per-repo
   data with the `owner__repo` pattern:
   ```
-  data.latest("forgejo", "shrug.games__infra").attributes.issues
-  data.latest("forgejo", "neil__aoc2024").attributes
+  data.latest("forgejo", "acme__infra").attributes.issues
+  data.latest("forgejo", "testuser__demo").attributes
   ```
 
 ---
@@ -105,7 +132,7 @@ Useful for registering swamp workflows as Gitea webhook receivers.
 - `list_pulls --state all` not smoke-tested.
 
 - `list_releases` only tested against a repo with zero releases. Test against
-  `neilhanlon/lxc-templates` (has 4 releases) to exercise the release schema.
+  `testuser/lxc-templates` (has 4 releases) to exercise the release schema.
 
 ---
 
@@ -119,8 +146,9 @@ Useful for registering swamp workflows as Gitea webhook receivers.
 
 - **`get_user`** — `GET /users/{username}` for resolving contributor info.
 
-- **`list_labels`** — `GET /repos/{owner}/{repo}/labels` to enumerate labels
-  before creating issues.
+- ~~**`list_labels`** — enumerate labels before creating issues.~~ ✅ shipped
+  2026.09.28.1 (plus `create_label`, `list_milestones`, `create_milestone`,
+  `add_issue_labels`).
 
 - **Sensitive output for `create_release` assets** — if release asset upload is
   added, presigned URLs should use `z.meta({ sensitive: true })`.

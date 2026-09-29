@@ -12,13 +12,77 @@ export const UserSchema = z.object({
   avatar_url: z.string(),
 });
 
-/** An issue/PR label. */
+/** An issue/PR label, as embedded in issues and pull requests. */
 export const LabelSchema = z.object({
   id: z.number(),
   name: z.string(),
   color: z.string(),
   description: z.string(),
 });
+
+/**
+ * A repository label as returned by the `/labels` collection and the
+ * issue-labels endpoints. A superset of the embedded `LabelSchema` — it also
+ * carries `url` and the `exclusive`/`is_archived` flags. Kept as a SEPARATE
+ * schema so the embedded `LabelSchema` used by `IssueSchema`/`PullRequestSchema`
+ * is never mutated (those responses omit `url`/`exclusive`/`is_archived`).
+ * `exclusive`/`is_archived` are optional to tolerate older Gitea/Forgejo builds.
+ */
+export const RepoLabelSchema = LabelSchema.extend({
+  exclusive: z.boolean().optional(),
+  is_archived: z.boolean().optional(),
+  // Optional: a forge/version that returns a lean label response (no `url`) must
+  // not throw a post-mutation parse error after create_label/add_issue_labels.
+  url: z.string().optional(),
+});
+
+/**
+ * A repository milestone. `due_on`/`closed_at` are nullish: Gitea/Forgejo emits
+ * the zero-time sentinel `0001-01-01T00:00:00Z` (or omits the field) when unset,
+ * which the methods normalize to `null` via `normalizeMilestone` before writing a
+ * snapshot so a CEL caller can't mistake the sentinel for a real date.
+ */
+export const MilestoneSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  description: z.string(),
+  state: z.enum(["open", "closed"]),
+  open_issues: z.number(),
+  closed_issues: z.number(),
+  // Gitea serializes Created/Updated as *time.Time with no omitempty — they can
+  // be null. Kept nullish so an embedded milestone with a null timestamp does not
+  // throw on the issue read path (list_issues/get_issue now surface milestone).
+  created_at: z.string().nullish(),
+  updated_at: z.string().nullish(),
+  due_on: z.string().nullish(),
+  closed_at: z.string().nullish(),
+});
+
+/** Map the Gitea zero-time sentinel (`0001-01-01…`), `undefined`, or `null` to `null`; pass real datetimes through. */
+export function nullIfZeroTime(v: string | null | undefined): string | null {
+  if (v === undefined || v === null) return null;
+  return v.startsWith("0001-01-01") ? null : v;
+}
+
+/** Normalize a parsed milestone's `due_on`/`closed_at` sentinels to `null`. */
+export function normalizeMilestone(
+  m: z.infer<typeof MilestoneSchema>,
+): z.infer<typeof MilestoneSchema> {
+  return {
+    ...m,
+    due_on: nullIfZeroTime(m.due_on),
+    closed_at: nullIfZeroTime(m.closed_at),
+  };
+}
+
+/** Normalize a parsed issue's embedded milestone dates (no-op when unset). */
+export function normalizeIssue(
+  issue: z.infer<typeof IssueSchema>,
+): z.infer<typeof IssueSchema> {
+  return issue.milestone
+    ? { ...issue, milestone: normalizeMilestone(issue.milestone) }
+    : issue;
+}
 
 /** Minimal repository reference embedded in an issue's `repository` field. */
 export const RepoMetaSchema = z.object({
@@ -69,6 +133,13 @@ export const IssueSchema = z.object({
   url: z.string(),
   user: UserSchema,
   labels: z.array(LabelSchema),
+  // The issue's associated milestone (null when unset). Surfaced so a driver can
+  // confirm create_issue/edit_issue milestone association from the snapshot — the
+  // forge attaches it server-side, but it was previously stripped here.
+  milestone: MilestoneSchema.nullable().optional(),
+  // Assignees (array; null/empty when none). Surfaced so create_issue/edit_issue
+  // assignee association is visible in the snapshot.
+  assignees: z.array(UserSchema).nullable().optional(),
   comments: z.number(),
   created_at: z.string(),
   updated_at: z.string(),
@@ -373,6 +444,31 @@ export function issueCommentsPath(
  */
 export function adminUsersPath(): string {
   return `/admin/users`;
+}
+
+/** Path for `list_labels` / `create_label` (a repository's label collection). SEC-1: encode every segment. */
+export function labelsPath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${
+    encodeURIComponent(repo)
+  }/labels`;
+}
+
+/** Path for `list_milestones` / `create_milestone` (a repository's milestone collection). SEC-1: encode every segment. */
+export function milestonesPath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${
+    encodeURIComponent(repo)
+  }/milestones`;
+}
+
+/** Path for `add_issue_labels` (an issue's label collection). SEC-1: encode every segment, including the index. */
+export function issueLabelsPath(
+  owner: string,
+  repo: string,
+  index: number,
+): string {
+  return `/repos/${encodeURIComponent(owner)}/${
+    encodeURIComponent(repo)
+  }/issues/${encodeURIComponent(String(index))}/labels`;
 }
 
 // Instance names key per-repo (or per-repo-per-number) data snapshots. The `__`
@@ -736,8 +832,11 @@ export const CreateIssueArgs = z.object({
   ...RepoRefArgs,
   title: z.string().min(1).describe("Issue title."),
   body: z.string().default("").describe("Issue body (markdown)."),
-  labels: z.array(z.number().int()).optional().describe(
-    "Label IDs to apply. Omit to apply none.",
+  labels: z.array(z.number().int().positive()).optional().describe(
+    "Label IDs to apply (Forgejo's issue API expects IDs, not names — resolve names to IDs from a list_labels snapshot). Omit to apply none.",
+  ),
+  milestone: z.number().int().positive().optional().describe(
+    "Milestone ID to associate (resolve from a list_milestones snapshot). Omit for none.",
   ),
   assignees: z.array(z.string()).optional().describe(
     "Usernames to assign. Omit to assign none.",
@@ -757,9 +856,21 @@ export const EditIssueArgs = z.object({
   state: z.enum(["open", "closed"]).optional().describe(
     "New state (open/closed). Omit to leave unchanged.",
   ),
+  milestone: z.number().int().positive().optional().describe(
+    "Set the milestone to this ID. Omit to leave unchanged (use clear_milestone to unset).",
+  ),
+  clear_milestone: z.boolean().optional().describe(
+    "Unset the issue's milestone (sends milestone=0). Mutually exclusive with milestone.",
+  ),
+  assignees: z.array(z.string()).optional().describe(
+    "Replace the issue's assignees with these usernames. Omit to leave unchanged; pass [] to clear all assignees.",
+  ),
   confirm: z.boolean().default(false).describe(
     "Must be true to edit the issue — this is a live mutation.",
   ),
+}).refine((a) => !(a.clear_milestone && a.milestone !== undefined), {
+  message: "Provide either milestone or clear_milestone, not both.",
+  path: ["clear_milestone"],
 });
 
 export const CreateIssueCommentArgs = z.object({
@@ -792,13 +903,85 @@ export const CreateUserArgs = z.object({
   ),
 });
 
+const ListLabelsArgs = z.object({ ...RepoRefArgs, ...PageArgs });
+
+/** 6-digit hex color, leading `#` optional (normalized to include it before the POST). */
+const HEX_COLOR = /^#?[0-9a-fA-F]{6}$/;
+
+export const CreateLabelArgs = z.object({
+  ...RepoRefArgs,
+  name: z.string().min(1).describe("Label name."),
+  color: z.string().regex(
+    HEX_COLOR,
+    "color must be a 6-digit hex like #00aabb (leading # optional)",
+  ).describe("Label color as a 6-digit hex (leading # optional; normalized)."),
+  description: z.string().default("").describe("Label description."),
+  exclusive: z.boolean().default(false).describe(
+    "Whether the label is exclusive within its scoped group (default false).",
+  ),
+  is_archived: z.boolean().default(false).describe(
+    "Whether the label is archived (default false).",
+  ),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to create the label — this is a live mutation.",
+  ),
+});
+
+const ListMilestonesArgs = z.object({
+  ...RepoRefArgs,
+  state: z.enum(["open", "closed", "all"]).default("open").describe(
+    "Filter by milestone state.",
+  ),
+  ...PageArgs,
+});
+
+export const CreateMilestoneArgs = z.object({
+  ...RepoRefArgs,
+  title: z.string().min(1).describe("Milestone title."),
+  description: z.string().default("").describe("Milestone description."),
+  due_on: z.string().datetime().optional().describe(
+    "Due date as an ISO-8601 datetime (e.g. 2026-12-31T00:00:00Z). Omit for no deadline.",
+  ),
+  state: z.enum(["open", "closed"]).default("open").describe(
+    "Initial milestone state (default open).",
+  ),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to create the milestone — this is a live mutation.",
+  ),
+});
+
+export const AddIssueLabelsArgs = z.object({
+  ...RepoRefArgs,
+  index: z.number().int().positive().describe("Issue number to add labels to."),
+  labels: z.array(z.number().int().positive()).min(1).describe(
+    "Label IDs to add (resolve from a list_labels snapshot). Appended to the issue's existing labels.",
+  ),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to add the labels — this is a live mutation.",
+  ),
+});
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
-/** The `@shrug/forgejo` model: read-only queries over the Forgejo/Gitea `/api/v1` REST surface. */
+/** The `@shrug/forgejo` model: read + confirm-gated write access over the Forgejo/Gitea `/api/v1` REST surface. */
 export const model = {
   type: "@shrug/forgejo",
-  version: "2026.07.17.1",
+  version: "2026.09.29.1",
   globalArguments: GlobalArgsSchema,
+
+  // globalArguments (host, token, metadata) are unchanged from the published
+  // 2026.07.17.1; every change since is purely additive (new label/milestone/
+  // issue-association methods + resources + optional method inputs, and surfacing
+  // the milestone/assignees fields on IssueSchema), so existing instances need no
+  // data transform — a no-op migration just advances their typeVersion.
+  upgrades: [
+    {
+      toVersion: "2026.09.29.1",
+      description:
+        "Additive write methods (labels, milestones, issue label/milestone/assignee association) and surfaced issue milestone/assignees fields; no globalArguments schema change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     repos: {
@@ -958,6 +1141,53 @@ export const model = {
       lifetime: "30m",
       garbageCollection: 5,
     },
+    labels: {
+      description: "Labels defined on a repository",
+      schema: z.object({
+        labels: z.array(RepoLabelSchema),
+        count: z.number(),
+        owner: z.string(),
+        repo: z.string(),
+      }),
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    label: {
+      description: "A single label created on a repository",
+      schema: RepoLabelSchema,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    milestones: {
+      description: "Milestones defined on a repository",
+      schema: z.object({
+        milestones: z.array(MilestoneSchema),
+        count: z.number(),
+        owner: z.string(),
+        repo: z.string(),
+        state: z.string(),
+      }),
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    milestone: {
+      description: "A single milestone created on a repository",
+      schema: MilestoneSchema,
+      lifetime: "1h",
+      garbageCollection: 5,
+    },
+    issue_labels: {
+      description: "The label set on an issue after an add-labels write",
+      schema: z.object({
+        labels: z.array(RepoLabelSchema),
+        count: z.number(),
+        owner: z.string(),
+        repo: z.string(),
+        index: z.number(),
+      }),
+      lifetime: "30m",
+      garbageCollection: 5,
+    },
   },
 
   methods: {
@@ -1047,7 +1277,7 @@ export const model = {
           issuesPath(args.owner, args.repo, args.state, args.page, args.limit),
         );
 
-        const issues = z.array(IssueSchema).parse(data);
+        const issues = z.array(IssueSchema).parse(data).map(normalizeIssue);
         const handle = await context.writeResource(
           "issues",
           instanceName(args.owner, args.repo),
@@ -1088,7 +1318,7 @@ export const model = {
           issuePath(args.owner, args.repo, args.index),
         );
 
-        const issue = IssueSchema.parse(data);
+        const issue = normalizeIssue(IssueSchema.parse(data));
         const handle = await context.writeResource(
           "issue",
           instanceName(args.owner, args.repo, args.index),
@@ -1771,6 +2001,7 @@ export const model = {
           body: args.body,
         };
         if (args.labels !== undefined) body.labels = args.labels;
+        if (args.milestone !== undefined) body.milestone = args.milestone;
         if (args.assignees !== undefined) body.assignees = args.assignees;
 
         const data = await apiPost(
@@ -1780,7 +2011,7 @@ export const model = {
           body,
         );
 
-        const issue = IssueSchema.parse(data);
+        const issue = normalizeIssue(IssueSchema.parse(data));
         const handle = await context.writeResource(
           "issue",
           instanceName(args.owner, args.repo, issue.number),
@@ -1819,6 +2050,13 @@ export const model = {
         if (args.title !== undefined) body.title = args.title;
         if (args.body !== undefined) body.body = args.body;
         if (args.state !== undefined) body.state = args.state;
+        // Milestone tri-state: explicit clear (0) wins, else set if provided,
+        // else leave unchanged (field absent). The schema's refine already
+        // forbids setting both clear_milestone and milestone.
+        if (args.clear_milestone) body.milestone = 0;
+        else if (args.milestone !== undefined) body.milestone = args.milestone;
+        // assignees: omit to leave unchanged; [] clears; [names] replaces.
+        if (args.assignees !== undefined) body.assignees = args.assignees;
 
         const data = await apiPatch(
           host,
@@ -1827,7 +2065,7 @@ export const model = {
           body,
         );
 
-        const issue = IssueSchema.parse(data);
+        const issue = normalizeIssue(IssueSchema.parse(data));
         const handle = await context.writeResource(
           "issue",
           instanceName(args.owner, args.repo, args.index),
@@ -1917,6 +2155,252 @@ export const model = {
         const handle = await context.writeResource("user", user.login, user);
 
         context.logger.info("Created user {login}", { login: user.login });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_labels: {
+      description:
+        "List labels defined on a repository (GET /repos/{owner}/{repo}/labels). Verify-first before create_label. Excludes org-level labels (GET /orgs/{org}/labels), which org repos may also carry.",
+      arguments: ListLabelsArgs,
+      execute: async (
+        args: z.infer<typeof ListLabelsArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        context.logger.info("Listing labels for {owner}/{repo} (page {page})", {
+          owner: args.owner,
+          repo: args.repo,
+          page: args.page,
+        });
+
+        const data = await apiGet(
+          host,
+          token,
+          `${
+            labelsPath(args.owner, args.repo)
+          }?page=${args.page}&limit=${args.limit}`,
+        );
+
+        const labels = z.array(RepoLabelSchema).parse(data);
+        const handle = await context.writeResource(
+          "labels",
+          instanceName(args.owner, args.repo),
+          { labels, count: labels.length, owner: args.owner, repo: args.repo },
+        );
+
+        context.logger.info("Fetched {count} labels for {owner}/{repo}", {
+          count: labels.length,
+          owner: args.owner,
+          repo: args.repo,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_label: {
+      description:
+        "Create a label on a repository (POST /repos/{owner}/{repo}/labels). Confirm-gated (a live mutation). A BARE create: it does NOT check for an existing same-named label — verify-first with list_labels. Gitea/Forgejo does NOT enforce unique label names, and list_labels returns only one page by default, so page through before deciding a name is absent or a duplicate may be created.",
+      arguments: CreateLabelArgs,
+      execute: async (
+        args: z.infer<typeof CreateLabelArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to create label without confirm:true (a live mutation).",
+          );
+        }
+        const color = args.color.startsWith("#")
+          ? args.color
+          : `#${args.color}`;
+        context.logger.info(
+          "Creating label {name} ({color}) on {owner}/{repo}",
+          {
+            name: args.name,
+            color,
+            owner: args.owner,
+            repo: args.repo,
+          },
+        );
+
+        const data = await apiPost(
+          host,
+          token,
+          labelsPath(args.owner, args.repo),
+          {
+            name: args.name,
+            color,
+            description: args.description,
+            exclusive: args.exclusive,
+            is_archived: args.is_archived,
+          },
+        );
+
+        const label = RepoLabelSchema.parse(data);
+        const handle = await context.writeResource(
+          "label",
+          instanceName(args.owner, args.repo, label.id),
+          label,
+        );
+
+        context.logger.info("Created label #{id}: {name}", {
+          id: label.id,
+          name: label.name,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_milestones: {
+      description:
+        "List milestones on a repository (GET /repos/{owner}/{repo}/milestones). Verify-first before create_milestone. Only one page is returned by default.",
+      arguments: ListMilestonesArgs,
+      execute: async (
+        args: z.infer<typeof ListMilestonesArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        context.logger.info(
+          "Listing {state} milestones for {owner}/{repo} (page {page})",
+          {
+            state: args.state,
+            owner: args.owner,
+            repo: args.repo,
+            page: args.page,
+          },
+        );
+
+        const data = await apiGet(
+          host,
+          token,
+          `${
+            milestonesPath(args.owner, args.repo)
+          }?state=${args.state}&page=${args.page}&limit=${args.limit}`,
+        );
+
+        const milestones = z.array(MilestoneSchema).parse(data).map(
+          normalizeMilestone,
+        );
+        const handle = await context.writeResource(
+          "milestones",
+          instanceName(args.owner, args.repo),
+          {
+            milestones,
+            count: milestones.length,
+            owner: args.owner,
+            repo: args.repo,
+            state: args.state,
+          },
+        );
+
+        context.logger.info("Fetched {count} milestones for {owner}/{repo}", {
+          count: milestones.length,
+          owner: args.owner,
+          repo: args.repo,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_milestone: {
+      description:
+        "Create a milestone on a repository (POST /repos/{owner}/{repo}/milestones). Confirm-gated (a live mutation). A BARE create: it does NOT check for an existing same-titled milestone — verify-first with list_milestones (titles are not unique; only one page is returned by default).",
+      arguments: CreateMilestoneArgs,
+      execute: async (
+        args: z.infer<typeof CreateMilestoneArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to create milestone without confirm:true (a live mutation).",
+          );
+        }
+        context.logger.info("Creating milestone {title} on {owner}/{repo}", {
+          title: args.title,
+          owner: args.owner,
+          repo: args.repo,
+        });
+
+        const body: Record<string, unknown> = {
+          title: args.title,
+          description: args.description,
+          state: args.state,
+        };
+        if (args.due_on !== undefined) body.due_on = args.due_on;
+
+        const data = await apiPost(
+          host,
+          token,
+          milestonesPath(args.owner, args.repo),
+          body,
+        );
+
+        const milestone = normalizeMilestone(MilestoneSchema.parse(data));
+        const handle = await context.writeResource(
+          "milestone",
+          instanceName(args.owner, args.repo, milestone.id),
+          milestone,
+        );
+
+        context.logger.info("Created milestone #{id}: {title}", {
+          id: milestone.id,
+          title: milestone.title,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    add_issue_labels: {
+      description:
+        "Add labels to an existing issue (POST /repos/{owner}/{repo}/issues/{index}/labels). Appends to the issue's existing labels. Label IDs are resolved by the caller from a list_labels snapshot. Confirm-gated (a live mutation).",
+      arguments: AddIssueLabelsArgs,
+      execute: async (
+        args: z.infer<typeof AddIssueLabelsArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to add issue labels without confirm:true (a live mutation).",
+          );
+        }
+        context.logger.info(
+          "Adding {count} label(s) to issue #{index} in {owner}/{repo}",
+          {
+            count: args.labels.length,
+            index: args.index,
+            owner: args.owner,
+            repo: args.repo,
+          },
+        );
+
+        const data = await apiPost(
+          host,
+          token,
+          issueLabelsPath(args.owner, args.repo, args.index),
+          { labels: args.labels },
+        );
+
+        const labels = z.array(RepoLabelSchema).parse(data);
+        const handle = await context.writeResource(
+          "issue_labels",
+          instanceName(args.owner, args.repo, args.index),
+          {
+            labels,
+            count: labels.length,
+            owner: args.owner,
+            repo: args.repo,
+            index: args.index,
+          },
+        );
+
+        context.logger.info("Issue #{index} now carries {count} label(s)", {
+          index: args.index,
+          count: labels.length,
+        });
         return { dataHandles: [handle] };
       },
     },

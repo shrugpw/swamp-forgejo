@@ -16,6 +16,7 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   AddCollaboratorArgs,
+  AddIssueLabelsArgs,
   adminUsersPath,
   apiDelete,
   apiGet,
@@ -27,20 +28,31 @@ import {
   collaboratorsPath,
   CommentSchema,
   CreateDeployKeyArgs,
+  CreateLabelArgs,
+  CreateMilestoneArgs,
   CreateUserArgs,
   DeployKeySchema,
   deployKeysPath,
+  EditIssueArgs,
   GlobalArgsSchema,
   instanceKey,
   instanceName,
   issueCommentsPath,
   issueEditPath,
+  issueLabelsPath,
   issuePath,
   IssueSchema,
   issuesCreatePath,
   issuesPath,
+  LabelSchema,
+  labelsPath,
   ListIssuesArgs,
+  MilestoneSchema,
+  milestonesPath,
   model,
+  normalizeIssue,
+  normalizeMilestone,
+  nullIfZeroTime,
   orgReposPath,
   OrgSchema,
   orgsPath,
@@ -50,6 +62,7 @@ import {
   pullsPath,
   releasesPath,
   repoBasePath,
+  RepoLabelSchema,
   repoPath,
   RepoSchema,
   teamMemberPath,
@@ -103,11 +116,11 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const USER = {
   id: 1,
-  login: "neil",
-  full_name: "Neil Hanlon",
-  email: "neil@example.com",
-  html_url: "https://git.shrug.pw/neil",
-  avatar_url: "https://git.shrug.pw/avatars/1",
+  login: "testuser",
+  full_name: "Test User",
+  email: "testuser@example.org",
+  html_url: "https://git.example.org/testuser",
+  avatar_url: "https://git.example.org/avatars/1",
 };
 
 // A PR as it appears in a *list* response: no additions/deletions/changed_files.
@@ -117,10 +130,10 @@ const PR_LIST_SHAPE = {
   title: "Add thing",
   state: "open",
   body: null,
-  html_url: "https://git.shrug.pw/o/r/pulls/3",
-  url: "https://git.shrug.pw/api/v1/repos/o/r/pulls/3",
-  diff_url: "https://git.shrug.pw/o/r/pulls/3.diff",
-  patch_url: "https://git.shrug.pw/o/r/pulls/3.patch",
+  html_url: "https://git.example.org/o/r/pulls/3",
+  url: "https://git.example.org/api/v1/repos/o/r/pulls/3",
+  diff_url: "https://git.example.org/o/r/pulls/3.diff",
+  patch_url: "https://git.example.org/o/r/pulls/3.patch",
   user: USER,
   labels: [],
   draft: false,
@@ -152,8 +165,8 @@ const ISSUE = {
   title: "Bug",
   state: "closed",
   body: null,
-  html_url: "https://git.shrug.pw/o/r/issues/2",
-  url: "https://git.shrug.pw/api/v1/repos/o/r/issues/2",
+  html_url: "https://git.example.org/o/r/issues/2",
+  url: "https://git.example.org/api/v1/repos/o/r/issues/2",
   user: USER,
   labels: [],
   comments: 1,
@@ -165,7 +178,7 @@ const ISSUE = {
 const DEPLOY_KEY = {
   id: 7,
   key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... swamp-serve-01",
-  url: "https://git.shrug.pw/api/v1/repos/shrugpw/swamp/keys/7",
+  url: "https://git.example.org/api/v1/repos/acme/swamp/keys/7",
   title: "swamp-serve-01",
   fingerprint: "SHA256:abc123",
   created_at: "2026-07-22T00:00:00Z",
@@ -175,14 +188,14 @@ const DEPLOY_KEY = {
 // ── 1. path builders (pure) ───────────────────────────────────────────────────
 
 Deno.test("issuesPath pins type=issues so PRs are excluded", () => {
-  const p = issuesPath("shrug", "infra", "open", 1, 50);
+  const p = issuesPath("acme", "infra", "open", 1, 50);
   assert(
     p.includes("type=issues"),
     "list_issues MUST filter out pull requests",
   );
   assertEquals(
     p,
-    "/repos/shrug/infra/issues?type=issues&state=open&page=1&limit=50",
+    "/repos/acme/infra/issues?type=issues&state=open&page=1&limit=50",
   );
 });
 
@@ -228,15 +241,15 @@ Deno.test("deployKeysPath percent-encodes owner/repo so a write can't be misdire
 });
 
 Deno.test("instanceName uses the __ separator CEL callers depend on", () => {
-  assertEquals(instanceName("shrug", "infra"), "shrug__infra");
-  assertEquals(instanceName("neil", "aoc2024", 12), "neil__aoc2024__12");
+  assertEquals(instanceName("acme", "infra"), "acme__infra");
+  assertEquals(instanceName("testuser", "demo", 12), "testuser__demo__12");
 });
 
 // ── 2. schemas ────────────────────────────────────────────────────────────────
 
 Deno.test("GlobalArgsSchema requires a URL host and defaults metadata", () => {
   const ok = GlobalArgsSchema.safeParse({
-    host: "https://git.shrug.pw",
+    host: "https://git.example.org",
     token: "t",
   });
   assert(ok.success);
@@ -297,9 +310,9 @@ Deno.test("RepoSchema: language is nullable", () => {
     mirror: false,
     archived: false,
     empty: false,
-    html_url: "https://git.shrug.pw/o/r",
-    ssh_url: "git@git.shrug.pw:o/r.git",
-    clone_url: "https://git.shrug.pw/o/r.git",
+    html_url: "https://git.example.org/o/r",
+    ssh_url: "git@git.example.org:o/r.git",
+    clone_url: "https://git.example.org/o/r.git",
     language: null,
     default_branch: "main",
     stars_count: 0,
@@ -320,7 +333,7 @@ Deno.test("DeployKeySchema parses the fixture and strips unknown fields", () => 
   const key = DeployKeySchema.parse({
     ...DEPLOY_KEY,
     key_id: 99,
-    repository: { id: 1, full_name: "shrugpw/swamp" },
+    repository: { id: 1, full_name: "acme/swamp" },
   });
   assertEquals(key.id, 7);
   assertEquals(key.fingerprint, "SHA256:abc123");
@@ -354,9 +367,13 @@ Deno.test("CreateDeployKeyArgs defaults read_only to true when omitted", () => {
 Deno.test("apiGet builds /api/v1 URL, strips trailing host slash, sends token auth", async () => {
   const mock = installMockFetch(() => jsonResponse({ ok: true }));
   try {
-    const out = await apiGet("https://git.shrug.pw/", "s3cr3t", "/repos/o/r");
+    const out = await apiGet(
+      "https://git.example.org/",
+      "s3cr3t",
+      "/repos/o/r",
+    );
     assertEquals(mock.calls.length, 1);
-    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r");
+    assertEquals(mock.calls[0].url, "https://git.example.org/api/v1/repos/o/r");
     assertEquals(mock.calls[0].headers.Authorization, "token s3cr3t");
     assertEquals(mock.calls[0].headers.Accept, "application/json");
     assertEquals(out, { ok: true });
@@ -371,7 +388,7 @@ Deno.test("apiGet throws on 404 with status + body", async () => {
   );
   try {
     await assertRejects(
-      () => apiGet("https://git.shrug.pw", "t", "/repos/o/missing"),
+      () => apiGet("https://git.example.org", "t", "/repos/o/missing"),
       Error,
       "404",
     );
@@ -384,7 +401,7 @@ Deno.test("apiGet throws on 500 and includes the body text", async () => {
   const mock = installMockFetch(() => new Response("boom", { status: 500 }));
   try {
     const err = await assertRejects(
-      () => apiGet("https://git.shrug.pw", "t", "/repos/o/r"),
+      () => apiGet("https://git.example.org", "t", "/repos/o/r"),
       Error,
     );
     assert(err.message.includes("500"));
@@ -399,7 +416,7 @@ Deno.test("apiPost builds /api/v1 URL, strips trailing host slash, sends token a
   try {
     const body = { title: "t", key: "ssh-ed25519 AAAA...", read_only: true };
     const out = await apiPost(
-      "https://git.shrug.pw/",
+      "https://git.example.org/",
       "s3cr3t",
       "/repos/o/r/keys",
       body,
@@ -407,7 +424,7 @@ Deno.test("apiPost builds /api/v1 URL, strips trailing host slash, sends token a
     assertEquals(mock.calls.length, 1);
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/keys",
+      "https://git.example.org/api/v1/repos/o/r/keys",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(mock.calls[0].headers.Authorization, "token s3cr3t");
@@ -426,7 +443,7 @@ Deno.test("apiPost throws on 422 with status + body", async () => {
   );
   try {
     const err = await assertRejects(
-      () => apiPost("https://git.shrug.pw", "t", "/repos/o/r/keys", {}),
+      () => apiPost("https://git.example.org", "t", "/repos/o/r/keys", {}),
       Error,
       "422",
     );
@@ -456,7 +473,7 @@ interface WrittenResource {
 function fakeContext(
   written: WrittenResource[],
   globalArgs: Record<string, unknown> = {
-    host: "https://git.shrug.pw",
+    host: "https://git.example.org",
     token: "t",
     metadata: {},
   },
@@ -484,14 +501,14 @@ Deno.test("list_issues.execute hits the type=issues URL and writes owner__repo",
   const written: WrittenResource[] = [];
   try {
     const res = await model.methods.list_issues.execute(
-      { owner: "shrug", repo: "infra", state: "all", page: 1, limit: 50 },
+      { owner: "acme", repo: "infra", state: "all", page: 1, limit: 50 },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assert(mock.calls[0].url.includes("/issues?type=issues&state=all"));
     assertEquals(written.length, 1);
     assertEquals(written[0].resource, "issues");
-    assertEquals(written[0].instance, "shrug__infra");
+    assertEquals(written[0].instance, "acme__infra");
     assertEquals(written[0].value.count, 1);
     assertEquals(written[0].value.state, "all");
     assertEquals(res.dataHandles.length, 1);
@@ -511,7 +528,7 @@ Deno.test("get_pull.execute parses diff stats and writes owner__repo__index", as
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/pulls/3",
+      "https://git.example.org/api/v1/repos/o/r/pulls/3",
     );
     assertEquals(written[0].instance, "o__r__3");
     assertEquals(written[0].value.additions, 42);
@@ -576,7 +593,7 @@ Deno.test("list_pulls.execute with state=open writes the pulls resource", async 
 const REPO_SHAPE = {
   id: 1,
   name: "infra",
-  full_name: "shrug/infra",
+  full_name: "acme/infra",
   description: "",
   private: false,
   fork: false,
@@ -584,9 +601,9 @@ const REPO_SHAPE = {
   mirror: false,
   archived: false,
   empty: false,
-  html_url: "https://git.shrug.pw/shrug/infra",
-  ssh_url: "git@git.shrug.pw:shrug/infra.git",
-  clone_url: "https://git.shrug.pw/shrug/infra.git",
+  html_url: "https://git.example.org/acme/infra",
+  ssh_url: "git@git.example.org:acme/infra.git",
+  clone_url: "https://git.example.org/acme/infra.git",
   language: "TypeScript",
   default_branch: "main",
   stars_count: 0,
@@ -611,7 +628,7 @@ Deno.test("list_repos.execute writes the repos resource at the 'main' instance",
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/user/repos?page=1&limit=50",
+      "https://git.example.org/api/v1/user/repos?page=1&limit=50",
     );
     assertEquals(written[0].resource, "repos");
     assertEquals(
@@ -632,17 +649,17 @@ Deno.test("get_repo.execute writes RepoSchema at owner__repo", async () => {
   const written: WrittenResource[] = [];
   try {
     await model.methods.get_repo.execute(
-      { owner: "shrug", repo: "infra" },
+      { owner: "acme", repo: "infra" },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/shrug/infra",
+      "https://git.example.org/api/v1/repos/acme/infra",
     );
     assertEquals(written[0].resource, "repo");
-    assertEquals(written[0].instance, "shrug__infra");
-    assertEquals(written[0].value.full_name, "shrug/infra");
+    assertEquals(written[0].instance, "acme__infra");
+    assertEquals(written[0].value.full_name, "acme/infra");
   } finally {
     mock.restore();
   }
@@ -659,7 +676,7 @@ Deno.test("get_issue.execute writes IssueSchema at owner__repo__index", async ()
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/issues/2",
+      "https://git.example.org/api/v1/repos/o/r/issues/2",
     );
     assertEquals(written[0].resource, "issue");
     assertEquals(written[0].instance, "o__r__2");
@@ -689,7 +706,7 @@ Deno.test("list_deploy_keys.execute GETs the keys collection and writes owner__r
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/keys",
+      "https://git.example.org/api/v1/repos/o/r/keys",
     );
     assertEquals(written.length, 1);
     assertEquals(written[0].resource, "deploy_keys");
@@ -718,7 +735,7 @@ Deno.test("create_deploy_key.execute POSTs the body and writes owner__repo__id",
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/keys",
+      "https://git.example.org/api/v1/repos/o/r/keys",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(
@@ -769,12 +786,12 @@ Deno.test("create_deploy_key surfaces an API error instead of writing a resource
 
 const ORG = {
   id: 3,
-  username: "shrugpw",
-  name: "shrugpw",
+  username: "acme",
+  name: "acme",
   full_name: "Shrug PW",
   description: "",
   visibility: "private",
-  avatar_url: "https://git.shrug.pw/avatars/3",
+  avatar_url: "https://git.example.org/avatars/3",
 };
 
 const TEAM = {
@@ -786,7 +803,7 @@ const TEAM = {
 
 const COMMENT = {
   id: 11,
-  html_url: "https://git.shrug.pw/o/r/issues/2#issuecomment-11",
+  html_url: "https://git.example.org/o/r/issues/2#issuecomment-11",
   body: "Looks good",
   user: USER,
   created_at: "2026-04-03T00:00:00Z",
@@ -800,17 +817,17 @@ function emptyResponse(status = 204): Response {
 // ── 6. write-ops: path builders (pure) ────────────────────────────────────────
 
 Deno.test("write/discovery path builders are exact", () => {
-  assertEquals(orgReposPath("shrugpw"), "/orgs/shrugpw/repos");
+  assertEquals(orgReposPath("acme"), "/orgs/acme/repos");
   assertEquals(orgsPath(), "/user/orgs");
-  assertEquals(orgTeamsPath("shrugpw"), "/orgs/shrugpw/teams");
-  assertEquals(teamMemberPath(4, "neil"), "/teams/4/members/neil");
+  assertEquals(orgTeamsPath("acme"), "/orgs/acme/teams");
+  assertEquals(teamMemberPath(4, "testuser"), "/teams/4/members/testuser");
   assertEquals(repoBasePath("o", "r"), "/repos/o/r");
   assertEquals(collaboratorsPath("o", "r"), "/repos/o/r/collaborators");
   assertEquals(
-    collaboratorPath("o", "r", "neil"),
-    "/repos/o/r/collaborators/neil",
+    collaboratorPath("o", "r", "testuser"),
+    "/repos/o/r/collaborators/testuser",
   );
-  assertEquals(userPath("neil"), "/users/neil");
+  assertEquals(userPath("testuser"), "/users/testuser");
   assertEquals(issuesCreatePath("o", "r"), "/repos/o/r/issues");
   assertEquals(issueEditPath("o", "r", 7), "/repos/o/r/issues/7");
   assertEquals(issueCommentsPath("o", "r", 7), "/repos/o/r/issues/7/comments");
@@ -843,9 +860,9 @@ Deno.test("every write path builder percent-encodes every segment (SEC-1)", () =
 });
 
 Deno.test("instanceKey joins arbitrary segments with the __ separator", () => {
-  assertEquals(instanceKey("o", "r", "neil"), "o__r__neil");
+  assertEquals(instanceKey("o", "r", "testuser"), "o__r__testuser");
   assertEquals(instanceKey("o", "r", 7, 11), "o__r__7__11");
-  assertEquals(instanceKey(4, "neil"), "4__neil");
+  assertEquals(instanceKey(4, "testuser"), "4__testuser");
 });
 
 Deno.test("instanceKey escapes segments so `__` inside a segment can't collide (CORR-1)", () => {
@@ -865,7 +882,7 @@ Deno.test("instanceKey escapes segments so `__` inside a segment can't collide (
 Deno.test("OrgSchema parses and strips extras", () => {
   const org = OrgSchema.parse({ ...ORG, website: "https://x", repo_count: 5 });
   assertEquals(org.id, 3);
-  assertEquals(org.username, "shrugpw");
+  assertEquals(org.username, "acme");
   assertEquals(org.visibility, "private");
   // deno-lint-ignore no-explicit-any
   assertEquals((org as any).website, undefined, "extras stripped");
@@ -873,13 +890,13 @@ Deno.test("OrgSchema parses and strips extras", () => {
 
 Deno.test("OrgSchema parses with only `username` (no `name`)", () => {
   const org = OrgSchema.parse({ ...ORG, name: undefined });
-  assertEquals(org.username, "shrugpw");
+  assertEquals(org.username, "acme");
   assertEquals(org.name, undefined);
 });
 
 Deno.test("OrgSchema parses with only `name` (no `username`)", () => {
   const org = OrgSchema.parse({ ...ORG, username: undefined });
-  assertEquals(org.name, "shrugpw");
+  assertEquals(org.name, "acme");
   assertEquals(org.username, undefined);
 });
 
@@ -907,7 +924,7 @@ Deno.test("TeamSchema parses and retains an optional units array (SPEC-1)", () =
 Deno.test("CommentSchema parses with an embedded user", () => {
   const c = CommentSchema.parse(COMMENT);
   assertEquals(c.id, 11);
-  assertEquals(c.user.login, "neil");
+  assertEquals(c.user.login, "testuser");
 });
 
 Deno.test("CollaboratorPermission accepts read/write/admin only", () => {
@@ -921,7 +938,7 @@ Deno.test("AddCollaboratorArgs defaults permission to write (least privilege) (T
   const parsed = AddCollaboratorArgs.parse({
     owner: "o",
     repo: "r",
-    username: "neil",
+    username: "testuser",
   });
   assertEquals(parsed.permission, "write");
 });
@@ -933,12 +950,12 @@ Deno.test("apiPatch sends PATCH with JSON body + token auth", async () => {
   try {
     const body = { description: "new" };
     const out = await apiPatch(
-      "https://git.shrug.pw/",
+      "https://git.example.org/",
       "s3cr3t",
       "/repos/o/r",
       body,
     );
-    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r");
+    assertEquals(mock.calls[0].url, "https://git.example.org/api/v1/repos/o/r");
     assertEquals(mock.calls[0].method, "PATCH");
     assertEquals(mock.calls[0].headers.Authorization, "token s3cr3t");
     assertEquals(mock.calls[0].headers["Content-Type"], "application/json");
@@ -953,7 +970,7 @@ Deno.test("apiPatch throws on non-2xx with status + body and names PATCH", async
   const mock = installMockFetch(() => new Response("bad", { status: 422 }));
   try {
     const err = await assertRejects(
-      () => apiPatch("https://git.shrug.pw", "t", "/repos/o/r", {}),
+      () => apiPatch("https://git.example.org", "t", "/repos/o/r", {}),
       Error,
       "422",
     );
@@ -969,9 +986,9 @@ Deno.test("apiPut with a body sends PUT + JSON and parses the response", async (
   try {
     const body = { permission: "write" };
     const out = await apiPut(
-      "https://git.shrug.pw/",
+      "https://git.example.org/",
       "s3cr3t",
-      "/repos/o/r/collaborators/neil",
+      "/repos/o/r/collaborators/testuser",
       body,
     );
     assertEquals(mock.calls[0].method, "PUT");
@@ -987,9 +1004,9 @@ Deno.test("apiPut returns null on a 204 empty body and omits Content-Type when b
   const mock = installMockFetch(() => emptyResponse(204));
   try {
     const out = await apiPut(
-      "https://git.shrug.pw",
+      "https://git.example.org",
       "t",
-      "/teams/4/members/neil",
+      "/teams/4/members/testuser",
     );
     assertEquals(out, null, "204 empty body -> null, never .json()");
     assertEquals(mock.calls[0].method, "PUT");
@@ -1008,7 +1025,7 @@ Deno.test("apiPut throws on non-2xx with status + body and names PUT", async () 
   const mock = installMockFetch(() => new Response("nope", { status: 403 }));
   try {
     const err = await assertRejects(
-      () => apiPut("https://git.shrug.pw", "t", "/x", { a: 1 }),
+      () => apiPut("https://git.example.org", "t", "/x", { a: 1 }),
       Error,
       "403",
     );
@@ -1023,12 +1040,12 @@ Deno.test("apiDelete returns null on 204 and sends DELETE + token auth", async (
   const mock = installMockFetch(() => emptyResponse(204));
   try {
     const out = await apiDelete(
-      "https://git.shrug.pw/",
+      "https://git.example.org/",
       "s3cr3t",
       "/repos/o/r",
     );
     assertEquals(out, null);
-    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r");
+    assertEquals(mock.calls[0].url, "https://git.example.org/api/v1/repos/o/r");
     assertEquals(mock.calls[0].method, "DELETE");
     assertEquals(mock.calls[0].headers.Authorization, "token s3cr3t");
   } finally {
@@ -1040,7 +1057,7 @@ Deno.test("apiDelete throws on non-2xx with status + body and names DELETE", asy
   const mock = installMockFetch(() => new Response("missing", { status: 404 }));
   try {
     const err = await assertRejects(
-      () => apiDelete("https://git.shrug.pw", "t", "/repos/o/r"),
+      () => apiDelete("https://git.example.org", "t", "/repos/o/r"),
       Error,
       "404",
     );
@@ -1076,6 +1093,18 @@ Deno.test("every write method refuses without confirm:true (no fetch, no write)"
       name: "create_issue_comment",
       args: { owner: "o", repo: "r", index: 2, body: "b" },
     },
+    {
+      name: "create_label",
+      args: { owner: "o", repo: "r", name: "bug", color: "#ff0000" },
+    },
+    {
+      name: "create_milestone",
+      args: { owner: "o", repo: "r", title: "v1" },
+    },
+    {
+      name: "add_issue_labels",
+      args: { owner: "o", repo: "r", index: 2, labels: [1] },
+    },
   ];
   for (const c of cases) {
     const mock = installMockFetch(() => {
@@ -1110,7 +1139,7 @@ Deno.test("create_org_repo POSTs to /orgs/{org}/repos and writes owner__name", a
   try {
     await model.methods.create_org_repo.execute(
       {
-        org: "shrugpw",
+        org: "acme",
         name: "infra",
         description: "",
         private: true,
@@ -1123,7 +1152,7 @@ Deno.test("create_org_repo POSTs to /orgs/{org}/repos and writes owner__name", a
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/orgs/shrugpw/repos",
+      "https://git.example.org/api/v1/orgs/acme/repos",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(
@@ -1137,8 +1166,8 @@ Deno.test("create_org_repo POSTs to /orgs/{org}/repos and writes owner__name", a
       }),
     );
     assertEquals(written[0].resource, "repo");
-    assertEquals(written[0].instance, "neil__infra");
-    assertEquals(written[0].value.full_name, "shrug/infra");
+    assertEquals(written[0].instance, "testuser__infra");
+    assertEquals(written[0].value.full_name, "acme/infra");
   } finally {
     mock.restore();
   }
@@ -1150,7 +1179,7 @@ Deno.test("edit_repo PATCHes only the provided fields and writes owner__repo", a
   try {
     await model.methods.edit_repo.execute(
       {
-        owner: "shrug",
+        owner: "acme",
         repo: "infra",
         private: false,
         description: "new desc",
@@ -1161,7 +1190,7 @@ Deno.test("edit_repo PATCHes only the provided fields and writes owner__repo", a
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/shrug/infra",
+      "https://git.example.org/api/v1/repos/acme/infra",
     );
     assertEquals(mock.calls[0].method, "PATCH");
     assertEquals(
@@ -1170,7 +1199,7 @@ Deno.test("edit_repo PATCHes only the provided fields and writes owner__repo", a
       "only provided fields are sent",
     );
     assertEquals(written[0].resource, "repo");
-    assertEquals(written[0].instance, "shrug__infra");
+    assertEquals(written[0].instance, "acme__infra");
   } finally {
     mock.restore();
   }
@@ -1203,7 +1232,7 @@ Deno.test("delete_repo DELETEs and writes no snapshot (204)", async () => {
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
-    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/repos/o/r");
+    assertEquals(mock.calls[0].url, "https://git.example.org/api/v1/repos/o/r");
     assertEquals(mock.calls[0].method, "DELETE");
     assertEquals(written.length, 0, "destructive delete writes no snapshot");
     assertEquals(res.dataHandles.length, 0);
@@ -1223,7 +1252,7 @@ Deno.test("edit_repo/delete_repo route through the percent-encoding builder (SEC
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/a%2Fb/r",
+      "https://git.example.org/api/v1/repos/a%2Fb/r",
     );
   } finally {
     mock.restore();
@@ -1243,7 +1272,7 @@ Deno.test("list_orgs GETs /user/orgs with pagination and writes orgs@main", asyn
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/user/orgs?page=1&limit=50",
+      "https://git.example.org/api/v1/user/orgs?page=1&limit=50",
     );
     assertEquals(written[0].resource, "orgs");
     assertEquals(written[0].instance, "main");
@@ -1258,18 +1287,18 @@ Deno.test("list_org_repos GETs /orgs/{org}/repos and writes org_repos@{org}", as
   const written: WrittenResource[] = [];
   try {
     await model.methods.list_org_repos.execute(
-      { org: "shrugpw", page: 1, limit: 50 },
+      { org: "acme", page: 1, limit: 50 },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/orgs/shrugpw/repos?page=1&limit=50",
+      "https://git.example.org/api/v1/orgs/acme/repos?page=1&limit=50",
     );
     assertEquals(written[0].resource, "org_repos");
-    assertEquals(written[0].instance, "shrugpw");
+    assertEquals(written[0].instance, "acme");
     assertEquals(written[0].value.count, 1);
-    assertEquals(written[0].value.org, "shrugpw");
+    assertEquals(written[0].value.org, "acme");
   } finally {
     mock.restore();
   }
@@ -1280,14 +1309,17 @@ Deno.test("get_user GETs /users/{username} and writes user@{username}", async ()
   const written: WrittenResource[] = [];
   try {
     await model.methods.get_user.execute(
-      { username: "neil" },
+      { username: "testuser" },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
-    assertEquals(mock.calls[0].url, "https://git.shrug.pw/api/v1/users/neil");
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.example.org/api/v1/users/testuser",
+    );
     assertEquals(written[0].resource, "user");
-    assertEquals(written[0].instance, "neil");
-    assertEquals(written[0].value.login, "neil");
+    assertEquals(written[0].instance, "testuser");
+    assertEquals(written[0].value.login, "testuser");
   } finally {
     mock.restore();
   }
@@ -1304,7 +1336,7 @@ Deno.test("list_collaborators GETs the collaborators collection and writes owner
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/collaborators",
+      "https://git.example.org/api/v1/repos/o/r/collaborators",
     );
     assertEquals(written[0].resource, "collaborators");
     assertEquals(written[0].instance, "o__r");
@@ -1319,16 +1351,16 @@ Deno.test("list_org_teams GETs /orgs/{org}/teams and writes org_teams@{org}", as
   const written: WrittenResource[] = [];
   try {
     await model.methods.list_org_teams.execute(
-      { org: "shrugpw" },
+      { org: "acme" },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/orgs/shrugpw/teams",
+      "https://git.example.org/api/v1/orgs/acme/teams",
     );
     assertEquals(written[0].resource, "org_teams");
-    assertEquals(written[0].instance, "shrugpw");
+    assertEquals(written[0].instance, "acme");
     assertEquals(written[0].value.count, 1);
   } finally {
     mock.restore();
@@ -1345,7 +1377,7 @@ Deno.test("add_collaborator PUTs {permission} and writes a synthesized membershi
       {
         owner: "o",
         repo: "r",
-        username: "neil",
+        username: "testuser",
         permission: "write",
         confirm: true,
       },
@@ -1354,16 +1386,16 @@ Deno.test("add_collaborator PUTs {permission} and writes a synthesized membershi
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/collaborators/neil",
+      "https://git.example.org/api/v1/repos/o/r/collaborators/testuser",
     );
     assertEquals(mock.calls[0].method, "PUT");
     assertEquals(mock.calls[0].body, JSON.stringify({ permission: "write" }));
     assertEquals(written[0].resource, "collaborator");
-    assertEquals(written[0].instance, "o__r__neil");
+    assertEquals(written[0].instance, "o__r__testuser");
     assertEquals(written[0].value, {
       owner: "o",
       repo: "r",
-      username: "neil",
+      username: "testuser",
       permission: "write",
     });
   } finally {
@@ -1388,7 +1420,7 @@ Deno.test("add_collaborator percent-encodes a hostile username segment (SEC-1)",
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/collaborators/a%2Fb",
+      "https://git.example.org/api/v1/repos/o/r/collaborators/a%2Fb",
     );
   } finally {
     mock.restore();
@@ -1400,13 +1432,13 @@ Deno.test("remove_collaborator DELETEs and writes no snapshot (204)", async () =
   const written: WrittenResource[] = [];
   try {
     const res = await model.methods.remove_collaborator.execute(
-      { owner: "o", repo: "r", username: "neil", confirm: true },
+      { owner: "o", repo: "r", username: "testuser", confirm: true },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/collaborators/neil",
+      "https://git.example.org/api/v1/repos/o/r/collaborators/testuser",
     );
     assertEquals(mock.calls[0].method, "DELETE");
     assertEquals(written.length, 0);
@@ -1421,19 +1453,19 @@ Deno.test("add_org_team_member PUTs (no body) and writes team_id__username (204)
   const written: WrittenResource[] = [];
   try {
     await model.methods.add_org_team_member.execute(
-      { team_id: 4, username: "neil", confirm: true },
+      { team_id: 4, username: "testuser", confirm: true },
       // deno-lint-ignore no-explicit-any
       fakeContext(written) as any,
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/teams/4/members/neil",
+      "https://git.example.org/api/v1/teams/4/members/testuser",
     );
     assertEquals(mock.calls[0].method, "PUT");
     assertEquals(mock.calls[0].body, undefined, "no request body");
     assertEquals(written[0].resource, "team_member");
-    assertEquals(written[0].instance, "4__neil");
-    assertEquals(written[0].value, { team_id: 4, username: "neil" });
+    assertEquals(written[0].instance, "4__testuser");
+    assertEquals(written[0].value, { team_id: 4, username: "testuser" });
   } finally {
     mock.restore();
   }
@@ -1452,7 +1484,7 @@ Deno.test("create_issue POSTs {title,body} and writes issue@owner__repo__number"
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/issues",
+      "https://git.example.org/api/v1/repos/o/r/issues",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(
@@ -1479,7 +1511,7 @@ Deno.test("create_issue includes labels + assignees when provided", async () => 
         title: "Bug",
         body: "b",
         labels: [1, 2],
-        assignees: ["neil"],
+        assignees: ["testuser"],
         confirm: true,
       },
       // deno-lint-ignore no-explicit-any
@@ -1491,7 +1523,7 @@ Deno.test("create_issue includes labels + assignees when provided", async () => 
         title: "Bug",
         body: "b",
         labels: [1, 2],
-        assignees: ["neil"],
+        assignees: ["testuser"],
       }),
     );
   } finally {
@@ -1510,7 +1542,7 @@ Deno.test("edit_issue PATCHes only provided fields and writes issue@owner__repo_
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/issues/2",
+      "https://git.example.org/api/v1/repos/o/r/issues/2",
     );
     assertEquals(mock.calls[0].method, "PATCH");
     assertEquals(
@@ -1551,7 +1583,7 @@ Deno.test("create_issue_comment POSTs {body} and writes issue_comment@owner__rep
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/o/r/issues/2/comments",
+      "https://git.example.org/api/v1/repos/o/r/issues/2/comments",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(mock.calls[0].body, JSON.stringify({ body: "Looks good" }));
@@ -1587,7 +1619,7 @@ Deno.test("create_org_repo percent-encodes a hostile org segment (TEST-3)", asyn
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/orgs/a%2Fb/repos",
+      "https://git.example.org/api/v1/orgs/a%2Fb/repos",
     );
   } finally {
     mock.restore();
@@ -1605,7 +1637,7 @@ Deno.test("add_org_team_member percent-encodes a hostile username segment (TEST-
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/teams/4/members/a%2Fb",
+      "https://git.example.org/api/v1/teams/4/members/a%2Fb",
     );
   } finally {
     mock.restore();
@@ -1623,7 +1655,7 @@ Deno.test("create_issue percent-encodes a hostile owner segment (TEST-3)", async
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues",
+      "https://git.example.org/api/v1/repos/a%2Fb/r/issues",
     );
   } finally {
     mock.restore();
@@ -1641,7 +1673,7 @@ Deno.test("edit_issue percent-encodes a hostile owner segment (TEST-3)", async (
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues/2",
+      "https://git.example.org/api/v1/repos/a%2Fb/r/issues/2",
     );
   } finally {
     mock.restore();
@@ -1659,7 +1691,7 @@ Deno.test("create_issue_comment percent-encodes a hostile owner segment (TEST-3)
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/repos/a%2Fb/r/issues/2/comments",
+      "https://git.example.org/api/v1/repos/a%2Fb/r/issues/2/comments",
     );
   } finally {
     mock.restore();
@@ -1678,7 +1710,7 @@ Deno.test("a confirmed write method surfaces an API error instead of writing", a
           {
             owner: "o",
             repo: "r",
-            username: "neil",
+            username: "testuser",
             permission: "write",
             confirm: true,
           },
@@ -1699,11 +1731,11 @@ Deno.test("a confirmed write method surfaces an API error instead of writing", a
 // A user account as returned by POST /admin/users.
 const ADMIN_USER = {
   id: 12,
-  login: "label",
-  full_name: "Louis Abel",
-  email: "label@example.com",
-  html_url: "https://git.shrug.pw/label",
-  avatar_url: "https://git.shrug.pw/avatars/12",
+  login: "newuser",
+  full_name: "New User",
+  email: "newuser@example.org",
+  html_url: "https://git.example.org/newuser",
+  avatar_url: "https://git.example.org/avatars/12",
 };
 
 Deno.test("adminUsersPath builds the exact /admin/users collection path", () => {
@@ -1712,8 +1744,8 @@ Deno.test("adminUsersPath builds the exact /admin/users collection path", () => 
 
 Deno.test("CreateUserArgs applies least-privilege defaults", () => {
   const parsed = CreateUserArgs.parse({
-    username: "label",
-    email: "label@example.com",
+    username: "newuser",
+    email: "newuser@example.org",
     password: "s3cr3t",
   });
   assertEquals(parsed.must_change_password, true);
@@ -1740,8 +1772,8 @@ Deno.test("UserSchema parses an admin-created user response and strips extras", 
     created: "2026-09-19T00:00:00Z",
   });
   assertEquals(user.id, 12);
-  assertEquals(user.login, "label");
-  assertEquals(user.email, "label@example.com");
+  assertEquals(user.login, "newuser");
+  assertEquals(user.email, "newuser@example.org");
   // deno-lint-ignore no-explicit-any
   assertEquals((user as any).is_admin, undefined, "unknown fields stripped");
 });
@@ -1752,8 +1784,8 @@ Deno.test("create_user POSTs /admin/users with defaults applied and writes user@
   try {
     await model.methods.create_user.execute(
       CreateUserArgs.parse({
-        username: "label",
-        email: "label@example.com",
+        username: "newuser",
+        email: "newuser@example.org",
         password: "s3cr3t",
         confirm: true,
       }),
@@ -1762,14 +1794,14 @@ Deno.test("create_user POSTs /admin/users with defaults applied and writes user@
     );
     assertEquals(
       mock.calls[0].url,
-      "https://git.shrug.pw/api/v1/admin/users",
+      "https://git.example.org/api/v1/admin/users",
     );
     assertEquals(mock.calls[0].method, "POST");
     assertEquals(
       mock.calls[0].body,
       JSON.stringify({
-        username: "label",
-        email: "label@example.com",
+        username: "newuser",
+        email: "newuser@example.org",
         password: "s3cr3t",
         must_change_password: true,
         restricted: false,
@@ -1778,8 +1810,8 @@ Deno.test("create_user POSTs /admin/users with defaults applied and writes user@
       "body carries username/email/password plus the applied least-privilege defaults",
     );
     assertEquals(written[0].resource, "user");
-    assertEquals(written[0].instance, "label", "keyed by the created login");
-    assertEquals(written[0].value.login, "label");
+    assertEquals(written[0].instance, "newuser", "keyed by the created login");
+    assertEquals(written[0].value.login, "newuser");
   } finally {
     mock.restore();
   }
@@ -1795,8 +1827,8 @@ Deno.test("create_user refuses without confirm:true (no fetch, no write)", async
       () =>
         model.methods.create_user.execute(
           CreateUserArgs.parse({
-            username: "label",
-            email: "label@example.com",
+            username: "newuser",
+            email: "newuser@example.org",
             password: "s3cr3t",
           }),
           // deno-lint-ignore no-explicit-any
@@ -1810,4 +1842,580 @@ Deno.test("create_user refuses without confirm:true (no fetch, no write)", async
   } finally {
     mock.restore();
   }
+});
+
+// ── 11. write-ops: labels, milestones, issue-association ────────────────────────
+
+const LABEL_SHAPE = {
+  id: 7,
+  name: "bug",
+  color: "ff0000",
+  description: "Something is broken",
+  exclusive: false,
+  is_archived: false,
+  url: "https://git.example.org/api/v1/repos/o/r/labels/7",
+};
+
+const MILESTONE_SHAPE = {
+  id: 3,
+  title: "v1.0",
+  description: "First release",
+  state: "open",
+  open_issues: 2,
+  closed_issues: 5,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-02-01T00:00:00Z",
+  due_on: "2026-12-31T00:00:00Z",
+  closed_at: null,
+};
+
+// A milestone with no deadline: Gitea/Forgejo emits the zero-time sentinel.
+const MILESTONE_NO_DEADLINE = {
+  ...MILESTONE_SHAPE,
+  id: 4,
+  title: "backlog",
+  due_on: "0001-01-01T00:00:00Z",
+  closed_at: "0001-01-01T00:00:00Z",
+};
+
+Deno.test("labels/milestones/issue-labels path builders are exact", () => {
+  assertEquals(labelsPath("o", "r"), "/repos/o/r/labels");
+  assertEquals(milestonesPath("o", "r"), "/repos/o/r/milestones");
+  assertEquals(issueLabelsPath("o", "r", 5), "/repos/o/r/issues/5/labels");
+});
+
+Deno.test("new label/milestone/issue-label path builders percent-encode every segment (SEC-1)", () => {
+  assertEquals(labelsPath("a/b", "c d"), "/repos/a%2Fb/c%20d/labels");
+  assertEquals(milestonesPath("../x", "r?y"), "/repos/..%2Fx/r%3Fy/milestones");
+  assertEquals(
+    issueLabelsPath("o#1", "r/2", 5),
+    "/repos/o%231/r%2F2/issues/5/labels",
+  );
+});
+
+Deno.test("RepoLabelSchema parses the full label incl url and optional flags", () => {
+  const l = RepoLabelSchema.parse(LABEL_SHAPE);
+  assertEquals(l.url, LABEL_SHAPE.url);
+  assertEquals(l.exclusive, false);
+  assertEquals(l.is_archived, false);
+});
+
+Deno.test("RepoLabelSchema tolerates missing exclusive/is_archived (older forges)", () => {
+  const l = RepoLabelSchema.parse({
+    id: 1,
+    name: "x",
+    color: "abcdef",
+    description: "",
+    url: "u",
+  });
+  assertEquals(l.exclusive, undefined);
+  assertEquals(l.is_archived, undefined);
+});
+
+Deno.test("embedded labels still parse via the unchanged LabelSchema after RepoLabelSchema (SW-7)", () => {
+  // Issue/PR responses embed labels WITHOUT url/exclusive/is_archived.
+  const issue = IssueSchema.parse({
+    ...ISSUE,
+    labels: [{ id: 1, name: "bug", color: "f00", description: "" }],
+  });
+  assertEquals(issue.labels[0].name, "bug");
+  // LabelSchema strips the richer fields if a response happens to carry them.
+  const stripped = LabelSchema.parse({
+    id: 1,
+    name: "bug",
+    color: "f00",
+    description: "",
+    url: "x",
+    exclusive: true,
+  });
+  assertEquals("url" in stripped, false);
+  assertEquals("exclusive" in stripped, false);
+});
+
+Deno.test("MilestoneSchema parses a real due_on and an absent due_on/closed_at", () => {
+  const m = MilestoneSchema.parse(MILESTONE_SHAPE);
+  assertEquals(m.due_on, "2026-12-31T00:00:00Z");
+  const { due_on: _d, closed_at: _c, ...rest } = MILESTONE_SHAPE;
+  const m2 = MilestoneSchema.parse(rest);
+  assertEquals(m2.due_on ?? null, null);
+  assertEquals(m2.closed_at ?? null, null);
+});
+
+Deno.test("nullIfZeroTime maps the sentinel and nullish to null, passes real dates through", () => {
+  assertEquals(nullIfZeroTime("0001-01-01T00:00:00Z"), null);
+  assertEquals(nullIfZeroTime(null), null);
+  assertEquals(nullIfZeroTime(undefined), null);
+  assertEquals(
+    nullIfZeroTime("2026-12-31T00:00:00Z"),
+    "2026-12-31T00:00:00Z",
+  );
+});
+
+Deno.test("normalizeMilestone nulls the zero-time due_on/closed_at sentinels", () => {
+  const m = normalizeMilestone(MilestoneSchema.parse(MILESTONE_NO_DEADLINE));
+  assertEquals(m.due_on, null);
+  assertEquals(m.closed_at, null);
+});
+
+Deno.test("list_labels.execute GETs the labels collection and writes owner__repo", async () => {
+  const mock = installMockFetch(() => jsonResponse([LABEL_SHAPE]));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.list_labels.execute(
+      { owner: "o", repo: "r", page: 1, limit: 50 },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assert(mock.calls[0].url.includes("/repos/o/r/labels?page=1&limit=50"));
+    assertEquals(mock.calls[0].headers["Authorization"], "token t");
+    assertEquals(written[0].resource, "labels");
+    assertEquals(written[0].instance, "o__r");
+    assertEquals(written[0].value.count, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_label.execute POSTs the body, normalizes color to include #, writes owner__repo__id", async () => {
+  const mock = installMockFetch(() => jsonResponse(LABEL_SHAPE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_label.execute(
+      {
+        owner: "o",
+        repo: "r",
+        name: "bug",
+        color: "ff0000",
+        description: "d",
+        exclusive: false,
+        is_archived: false,
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.example.org/api/v1/repos/o/r/labels",
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!).color, "#ff0000");
+    assertEquals(written[0].resource, "label");
+    assertEquals(written[0].instance, "o__r__7");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("CreateLabelArgs validates the color as anchored hex", () => {
+  assertEquals(
+    CreateLabelArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      name: "x",
+      color: "red",
+    })
+      .success,
+    false,
+  );
+  assert(
+    CreateLabelArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      name: "x",
+      color: "#00aabb",
+    }).success,
+  );
+  assert(
+    CreateLabelArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      name: "x",
+      color: "00aabb",
+    }).success,
+  );
+});
+
+Deno.test("list_milestones.execute threads state and normalizes the zero-time due_on to null (SW-11)", async () => {
+  const mock = installMockFetch(() => jsonResponse([MILESTONE_NO_DEADLINE]));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.list_milestones.execute(
+      { owner: "o", repo: "r", state: "all", page: 1, limit: 50 },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assert(
+      mock.calls[0].url.includes("/milestones?state=all&page=1&limit=50"),
+    );
+    assertEquals(written[0].resource, "milestones");
+    assertEquals(written[0].instance, "o__r");
+    assertEquals(written[0].value.milestones[0].due_on, null);
+    assertEquals(written[0].value.milestones[0].closed_at, null);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_milestone.execute POSTs title/description/state (+due_on) and writes owner__repo__id", async () => {
+  const mock = installMockFetch(() => jsonResponse(MILESTONE_SHAPE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_milestone.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "v1.0",
+        description: "d",
+        due_on: "2026-12-31T00:00:00Z",
+        state: "open",
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.example.org/api/v1/repos/o/r/milestones",
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!), {
+      title: "v1.0",
+      description: "d",
+      state: "open",
+      due_on: "2026-12-31T00:00:00Z",
+    });
+    assertEquals(written[0].resource, "milestone");
+    assertEquals(written[0].instance, "o__r__3");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_milestone.execute normalizes a zero-time due_on/closed_at to null in the snapshot (CR-7)", async () => {
+  // The forge can echo a no-deadline milestone with the zero-time sentinel;
+  // create_milestone must normalize it on the create path, not only the list path.
+  const mock = installMockFetch(() => jsonResponse(MILESTONE_NO_DEADLINE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_milestone.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "backlog",
+        description: "",
+        state: "open",
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(written[0].resource, "milestone");
+    assertEquals(written[0].value.due_on, null);
+    assertEquals(written[0].value.closed_at, null);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_milestone.execute omits due_on from the body when not provided", async () => {
+  const mock = installMockFetch(() => jsonResponse(MILESTONE_SHAPE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_milestone.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "v1.0",
+        description: "d",
+        state: "open",
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals("due_on" in JSON.parse(mock.calls[0].body!), false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("CreateMilestoneArgs rejects a non-ISO due_on", () => {
+  assertEquals(
+    CreateMilestoneArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      title: "x",
+      due_on: "tomorrow",
+    }).success,
+    false,
+  );
+  assert(
+    CreateMilestoneArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      title: "x",
+      due_on: "2026-12-31T00:00:00Z",
+    }).success,
+  );
+});
+
+Deno.test("add_issue_labels.execute POSTs {labels} and writes owner__repo__index", async () => {
+  const mock = installMockFetch(() => jsonResponse([LABEL_SHAPE]));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.add_issue_labels.execute(
+      { owner: "o", repo: "r", index: 2, labels: [7], confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.example.org/api/v1/repos/o/r/issues/2/labels",
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!), { labels: [7] });
+    assertEquals(written[0].resource, "issue_labels");
+    assertEquals(written[0].instance, "o__r__2");
+    assertEquals(written[0].value.count, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("AddIssueLabelsArgs rejects an empty labels array", () => {
+  assertEquals(
+    AddIssueLabelsArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      index: 2,
+      labels: [],
+    })
+      .success,
+    false,
+  );
+});
+
+Deno.test("create_issue.execute passes the milestone id and label ids in the body", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_issue.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "t",
+        body: "",
+        labels: [7],
+        milestone: 3,
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    const body = JSON.parse(mock.calls[0].body!);
+    assertEquals(body.milestone, 3);
+    assertEquals(body.labels, [7]);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute omits milestone when neither set (leave unchanged)", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      {
+        owner: "o",
+        repo: "r",
+        index: 2,
+        title: "new",
+        clear_milestone: false,
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals("milestone" in JSON.parse(mock.calls[0].body!), false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute sends milestone:0 when clear_milestone is set", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      { owner: "o", repo: "r", index: 2, clear_milestone: true, confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!).milestone, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute sends the milestone id when provided", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      {
+        owner: "o",
+        repo: "r",
+        index: 2,
+        milestone: 9,
+        clear_milestone: false,
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!).milestone, 9);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("EditIssueArgs rejects setting both milestone and clear_milestone (SW-12)", () => {
+  assertEquals(
+    EditIssueArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      index: 2,
+      milestone: 9,
+      clear_milestone: true,
+    }).success,
+    false,
+  );
+});
+
+// ── 12. issue milestone/assignee surfacing + edit_issue assignees ────────────────
+
+Deno.test("IssueSchema surfaces milestone and assignees when present", () => {
+  const issue = IssueSchema.parse({
+    ...ISSUE,
+    milestone: MILESTONE_SHAPE,
+    assignees: [USER],
+  });
+  assertEquals(issue.milestone?.id, MILESTONE_SHAPE.id);
+  assertEquals(issue.assignees?.length, 1);
+  assertEquals(issue.assignees?.[0].login, USER.login);
+});
+
+Deno.test("IssueSchema tolerates absent/null milestone and assignees", () => {
+  const bare = IssueSchema.parse(ISSUE); // fixture has neither
+  assertEquals(bare.milestone ?? null, null);
+  assertEquals(bare.assignees ?? null, null);
+  const nulls = IssueSchema.parse({
+    ...ISSUE,
+    milestone: null,
+    assignees: null,
+  });
+  assertEquals(nulls.milestone, null);
+  assertEquals(nulls.assignees, null);
+});
+
+Deno.test("normalizeIssue nulls the embedded milestone zero-time sentinel", () => {
+  const issue = normalizeIssue(
+    IssueSchema.parse({ ...ISSUE, milestone: MILESTONE_NO_DEADLINE }),
+  );
+  assertEquals(issue.milestone?.due_on, null);
+  assertEquals(issue.milestone?.closed_at, null);
+});
+
+Deno.test("create_issue.execute surfaces milestone + assignees in the written snapshot", async () => {
+  const mock = installMockFetch(() =>
+    jsonResponse({
+      ...ISSUE,
+      number: 5,
+      milestone: MILESTONE_SHAPE,
+      assignees: [USER],
+    })
+  );
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_issue.execute(
+      {
+        owner: "o",
+        repo: "r",
+        title: "t",
+        body: "",
+        milestone: 3,
+        assignees: ["testuser"],
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    // request carries both associations
+    const body = JSON.parse(mock.calls[0].body!);
+    assertEquals(body.milestone, 3);
+    assertEquals(body.assignees, ["testuser"]);
+    // snapshot now surfaces them (previously stripped)
+    assertEquals(written[0].value.milestone.id, MILESTONE_SHAPE.id);
+    assertEquals(written[0].value.assignees[0].login, USER.login);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute sends assignees when provided", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      { owner: "o", repo: "r", index: 2, assignees: ["a", "b"], confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!).assignees, ["a", "b"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute omits assignees from the body when not provided", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      { owner: "o", repo: "r", index: 2, title: "x", confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals("assignees" in JSON.parse(mock.calls[0].body!), false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("edit_issue.execute sends an empty array to clear assignees", async () => {
+  const mock = installMockFetch(() => jsonResponse(ISSUE));
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.edit_issue.execute(
+      { owner: "o", repo: "r", index: 2, assignees: [], confirm: true },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!).assignees, []);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("IssueSchema parses an embedded milestone with a null updated_at/created_at (CR-2 hardening)", () => {
+  // Gitea serializes Milestone.Created/Updated as *time.Time (no omitempty) — they
+  // can be null; a milestoned issue must not throw on the read path.
+  const issue = IssueSchema.parse({
+    ...ISSUE,
+    milestone: { ...MILESTONE_SHAPE, created_at: null, updated_at: null },
+  });
+  assertEquals(issue.milestone?.updated_at ?? null, null);
+  assertEquals(issue.milestone?.created_at ?? null, null);
+  assertEquals(issue.milestone?.id, MILESTONE_SHAPE.id);
 });
