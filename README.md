@@ -47,6 +47,7 @@ percent-encoded.
 | `edit_issue` | Patch an issue. `milestone` sets / `clear_milestone` unsets (mutually exclusive); `assignees` (array) replaces, `[]` clears. |
 | `create_issue_comment` | Comment on an issue. |
 | `add_issue_labels` | Add labels (by ID) to an existing issue. |
+| `create_pull` | Open a pull request (`head` → `base`, both required); optional `labels`/`milestone`/`assignees`. Verify-first with `list_pulls`. |
 | `create_label` | Create a label (anchored-hex color). Bare create — verify-first with `list_labels`. |
 | `create_milestone` | Create a milestone (ISO-8601 `due_on`). Bare create — verify-first with `list_milestones`. |
 | `create_user` | Create a normal user account (requires a site-admin token). |
@@ -121,7 +122,8 @@ swamp model method run forgejo get_pull   --arg owner=acme --arg repo=infra --ar
   verify-first is the caller's responsibility, and a single `list_*` page may
   miss items past `limit`. There is no delete/edit surface for labels,
   milestones, or deploy keys yet — prune in the Forgejo UI.
-- **No PR merge path.** `create_pull`/`merge_pull` are not implemented yet.
+- **No PR merge path.** `create_pull` opens PRs, but `merge_pull` and
+  reviewer-request are not implemented yet.
 
 ## Development
 

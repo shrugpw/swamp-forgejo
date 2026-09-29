@@ -30,6 +30,7 @@ import {
   CreateDeployKeyArgs,
   CreateLabelArgs,
   CreateMilestoneArgs,
+  CreatePullArgs,
   CreateUserArgs,
   DeployKeySchema,
   deployKeysPath,
@@ -52,6 +53,7 @@ import {
   model,
   normalizeIssue,
   normalizeMilestone,
+  normalizePull,
   nullIfZeroTime,
   orgReposPath,
   OrgSchema,
@@ -59,6 +61,7 @@ import {
   orgTeamsPath,
   pullPath,
   PullRequestSchema,
+  pullsCreatePath,
   pullsPath,
   releasesPath,
   repoBasePath,
@@ -1104,6 +1107,10 @@ Deno.test("every write method refuses without confirm:true (no fetch, no write)"
     {
       name: "add_issue_labels",
       args: { owner: "o", repo: "r", index: 2, labels: [1] },
+    },
+    {
+      name: "create_pull",
+      args: { owner: "o", repo: "r", head: "feat", base: "main", title: "t" },
     },
   ];
   for (const c of cases) {
@@ -2418,4 +2425,172 @@ Deno.test("IssueSchema parses an embedded milestone with a null updated_at/creat
   assertEquals(issue.milestone?.updated_at ?? null, null);
   assertEquals(issue.milestone?.created_at ?? null, null);
   assertEquals(issue.milestone?.id, MILESTONE_SHAPE.id);
+});
+
+// ── 13. write-ops: create_pull ───────────────────────────────────────────────
+
+Deno.test("pullsCreatePath is exact and percent-encodes every segment (SEC-1)", () => {
+  assertEquals(pullsCreatePath("o", "r"), "/repos/o/r/pulls");
+  assertEquals(pullsCreatePath("a/b", "c d"), "/repos/a%2Fb/c%20d/pulls");
+  assertEquals(pullsCreatePath("../x", "r?y"), "/repos/..%2Fx/r%3Fy/pulls");
+});
+
+Deno.test("CreatePullArgs requires non-empty head/base/title", () => {
+  assertEquals(
+    CreatePullArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      head: "",
+      base: "main",
+      title: "t",
+    }).success,
+    false,
+  );
+  assertEquals(
+    CreatePullArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      head: "feat",
+      base: "",
+      title: "t",
+    }).success,
+    false,
+  );
+  assertEquals(
+    CreatePullArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      head: "feat",
+      base: "main",
+      title: "",
+    }).success,
+    false,
+  );
+  assert(
+    CreatePullArgs.safeParse({
+      owner: "o",
+      repo: "r",
+      head: "feat",
+      base: "main",
+      title: "t",
+    }).success,
+  );
+});
+
+Deno.test("PullRequestSchema surfaces milestone + assignees and tolerates their absence (SW-1)", () => {
+  const withAssoc = PullRequestSchema.parse({
+    ...PR_LIST_SHAPE,
+    milestone: MILESTONE_SHAPE,
+    assignees: [USER],
+  });
+  assertEquals(withAssoc.milestone?.id, MILESTONE_SHAPE.id);
+  assertEquals(withAssoc.assignees?.[0].login, USER.login);
+  const bare = PullRequestSchema.parse(PR_LIST_SHAPE); // no milestone/assignees
+  assertEquals(bare.milestone ?? null, null);
+  assertEquals(bare.assignees ?? null, null);
+});
+
+Deno.test("PullRequestSchema parses a create response omitting state-dependent fields (SEC-2)", () => {
+  // A freshly created PR may omit mergeable/merged_at/merge_commit_sha entirely.
+  const {
+    mergeable: _m,
+    merged_at: _ma,
+    merge_commit_sha: _sha,
+    closed_at: _c,
+    ...lean
+  } = PR_LIST_SHAPE;
+  const pr = PullRequestSchema.parse(lean);
+  assertEquals(pr.number, PR_LIST_SHAPE.number);
+  assertEquals(pr.mergeable ?? null, null);
+});
+
+Deno.test("normalizePull nulls the embedded milestone zero-time sentinel", () => {
+  const pr = normalizePull(
+    PullRequestSchema.parse({
+      ...PR_LIST_SHAPE,
+      milestone: MILESTONE_NO_DEADLINE,
+    }),
+  );
+  assertEquals(pr.milestone?.due_on, null);
+});
+
+Deno.test("create_pull.execute POSTs title/head/base (+ optional assoc) and writes owner__repo__<response-number>", async () => {
+  const mock = installMockFetch(() =>
+    jsonResponse({
+      ...PR_LIST_SHAPE,
+      number: 42,
+      milestone: MILESTONE_SHAPE,
+      assignees: [USER],
+    })
+  );
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_pull.execute(
+      {
+        owner: "o",
+        repo: "r",
+        head: "feat",
+        base: "main",
+        title: "Add thing",
+        body: "why",
+        labels: [7],
+        milestone: 3,
+        assignees: ["testuser"],
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    assertEquals(mock.calls[0].method, "POST");
+    assertEquals(
+      mock.calls[0].url,
+      "https://git.example.org/api/v1/repos/o/r/pulls",
+    );
+    assertEquals(JSON.parse(mock.calls[0].body!), {
+      title: "Add thing",
+      head: "feat",
+      base: "main",
+      body: "why",
+      labels: [7],
+      milestone: 3,
+      assignees: ["testuser"],
+    });
+    assertEquals(written[0].resource, "pull");
+    // keyed off the RESPONSE number, not any input (SW-2)
+    assertEquals(written[0].instance, "o__r__42");
+    assertEquals(written[0].value.milestone.id, MILESTONE_SHAPE.id);
+    assertEquals(written[0].value.assignees[0].login, USER.login);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("create_pull.execute omits optional associations when not provided", async () => {
+  const mock = installMockFetch(() =>
+    jsonResponse({ ...PR_LIST_SHAPE, number: 5 })
+  );
+  const written: WrittenResource[] = [];
+  try {
+    await model.methods.create_pull.execute(
+      {
+        owner: "o",
+        repo: "r",
+        head: "feat",
+        base: "main",
+        title: "t",
+        body: "",
+        confirm: true,
+      },
+      // deno-lint-ignore no-explicit-any
+      fakeContext(written) as any,
+    );
+    const body = JSON.parse(mock.calls[0].body!);
+    assertEquals(body, { title: "t", head: "feat", base: "main", body: "" });
+    assertEquals("labels" in body, false);
+    assertEquals("milestone" in body, false);
+    assertEquals("assignees" in body, false);
+    assertEquals(written[0].instance, "o__r__5");
+  } finally {
+    mock.restore();
+  }
 });

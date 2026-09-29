@@ -84,6 +84,15 @@ export function normalizeIssue(
     : issue;
 }
 
+/** Normalize a parsed pull request's embedded milestone dates (no-op when unset). */
+export function normalizePull(
+  pull: z.infer<typeof PullRequestSchema>,
+): z.infer<typeof PullRequestSchema> {
+  return pull.milestone
+    ? { ...pull, milestone: normalizeMilestone(pull.milestone) }
+    : pull;
+}
+
 /** Minimal repository reference embedded in an issue's `repository` field. */
 export const RepoMetaSchema = z.object({
   id: z.number(),
@@ -169,9 +178,18 @@ export const PullRequestSchema = z.object({
   patch_url: z.string(),
   user: UserSchema,
   labels: z.array(LabelSchema),
+  // Milestone/assignees are surfaced so create_pull association is visible in the
+  // snapshot (parity with IssueSchema). Absent from list/get responses when unset,
+  // so nullable+optional keeps get_pull/list_pulls parsing unchanged.
+  milestone: MilestoneSchema.nullable().optional(),
+  assignees: z.array(UserSchema).nullable().optional(),
   draft: z.boolean(),
   merged: z.boolean(),
-  mergeable: z.boolean().nullable(),
+  // State-dependent fields: on a freshly created PR the forge may leave these
+  // uncomputed (null) or omit them entirely across versions — kept nullish so a
+  // create-response parse can't throw AFTER the PR is created (post-mutation
+  // parse-throw defense, mirroring RepoLabelSchema.url).
+  mergeable: z.boolean().nullish(),
   comments: z.number(),
   review_comments: z.number(),
   // Absent from list responses; only populated by get_pull
@@ -182,9 +200,9 @@ export const PullRequestSchema = z.object({
   base: PRBranchSchema,
   created_at: z.string(),
   updated_at: z.string(),
-  closed_at: z.string().nullable(),
-  merged_at: z.string().nullable(),
-  merge_commit_sha: z.string().nullable(),
+  closed_at: z.string().nullish(),
+  merged_at: z.string().nullish(),
+  merge_commit_sha: z.string().nullish(),
 });
 
 /** A release for a repository. */
@@ -413,6 +431,17 @@ export function issuesCreatePath(owner: string, repo: string): string {
   return `/repos/${encodeURIComponent(owner)}/${
     encodeURIComponent(repo)
   }/issues`;
+}
+
+/**
+ * Path for `create_pull` (a repository's pull-request collection). SEC-1: encode
+ * every caller segment. Separate from the read-only `pullsPath` (which appends
+ * query params and is not encoded) because this backs a live mutation.
+ */
+export function pullsCreatePath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${
+    encodeURIComponent(repo)
+  }/pulls`;
 }
 
 /** Path for `edit_issue` (a single issue, mutating). */
@@ -961,12 +990,36 @@ export const AddIssueLabelsArgs = z.object({
   ),
 });
 
+export const CreatePullArgs = z.object({
+  ...RepoRefArgs,
+  head: z.string().min(1).describe(
+    "Source branch, or '<user>:<branch>' for a fork's branch.",
+  ),
+  base: z.string().min(1).describe(
+    "Target branch to merge into. Required — read the repo's default branch from a get_repo/list_repos snapshot if you want it.",
+  ),
+  title: z.string().min(1).describe("Pull request title."),
+  body: z.string().default("").describe("Pull request body (markdown)."),
+  labels: z.array(z.number().int().positive()).optional().describe(
+    "Label IDs to apply (resolve from a list_labels snapshot). Omit to apply none.",
+  ),
+  milestone: z.number().int().positive().optional().describe(
+    "Milestone ID to associate (resolve from a list_milestones snapshot). Omit for none.",
+  ),
+  assignees: z.array(z.string()).optional().describe(
+    "Usernames to assign. Omit to assign none.",
+  ),
+  confirm: z.boolean().default(false).describe(
+    "Must be true to create the pull request — this is a live mutation.",
+  ),
+});
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /** The `@shrug/forgejo` model: read + confirm-gated write access over the Forgejo/Gitea `/api/v1` REST surface. */
 export const model = {
   type: "@shrug/forgejo",
-  version: "2026.09.29.1",
+  version: "2026.09.29.2",
   globalArguments: GlobalArgsSchema,
 
   // globalArguments (host, token, metadata) are unchanged from the published
@@ -976,9 +1029,9 @@ export const model = {
   // data transform — a no-op migration just advances their typeVersion.
   upgrades: [
     {
-      toVersion: "2026.09.29.1",
+      toVersion: "2026.09.29.2",
       description:
-        "Additive write methods (labels, milestones, issue label/milestone/assignee association) and surfaced issue milestone/assignees fields; no globalArguments schema change.",
+        "Additive write methods (labels, milestones, issue label/milestone/assignee association, create_pull) and surfaced issue/PR milestone/assignees fields; no globalArguments schema change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1357,7 +1410,7 @@ export const model = {
           pullsPath(args.owner, args.repo, args.state, args.page, args.limit),
         );
 
-        const pulls = z.array(PullRequestSchema).parse(data);
+        const pulls = z.array(PullRequestSchema).parse(data).map(normalizePull);
         const handle = await context.writeResource(
           "pulls",
           instanceName(args.owner, args.repo),
@@ -1401,7 +1454,7 @@ export const model = {
           pullPath(args.owner, args.repo, args.index),
         );
 
-        const pull = PullRequestSchema.parse(data);
+        const pull = normalizePull(PullRequestSchema.parse(data));
         const handle = await context.writeResource(
           "pull",
           instanceName(args.owner, args.repo, args.index),
@@ -2401,6 +2454,68 @@ export const model = {
           index: args.index,
           count: labels.length,
         });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_pull: {
+      description:
+        "Open a pull request (POST /repos/{owner}/{repo}/pulls). Confirm-gated (a live mutation). A BARE create — verify-first with list_pulls (state=open) for an existing head->base PR before calling; Forgejo also rejects a duplicate open head->base PR server-side (409/422), so this is not idempotent on its own. `base` is required; resolve label/milestone IDs from list_labels/list_milestones snapshots. Reviewers are set via a separate endpoint and are not supported here.",
+      arguments: CreatePullArgs,
+      execute: async (
+        args: z.infer<typeof CreatePullArgs>,
+        context: Context,
+      ) => {
+        const { host, token } = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to create pull request without confirm:true (a live mutation).",
+          );
+        }
+        context.logger.info(
+          "Creating PR {title} ({head} -> {base}) in {owner}/{repo}",
+          {
+            title: args.title,
+            head: args.head,
+            base: args.base,
+            owner: args.owner,
+            repo: args.repo,
+          },
+        );
+
+        const body: Record<string, unknown> = {
+          title: args.title,
+          head: args.head,
+          base: args.base,
+          body: args.body,
+        };
+        if (args.labels !== undefined) body.labels = args.labels;
+        if (args.milestone !== undefined) body.milestone = args.milestone;
+        if (args.assignees !== undefined) body.assignees = args.assignees;
+
+        const data = await apiPost(
+          host,
+          token,
+          pullsCreatePath(args.owner, args.repo),
+          body,
+        );
+
+        const pull = normalizePull(PullRequestSchema.parse(data));
+        const handle = await context.writeResource(
+          "pull",
+          instanceName(args.owner, args.repo, pull.number),
+          pull,
+        );
+
+        context.logger.info(
+          "Created PR #{number}: {title} ({head} -> {base})",
+          {
+            number: pull.number,
+            title: pull.title,
+            head: args.head,
+            base: args.base,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },

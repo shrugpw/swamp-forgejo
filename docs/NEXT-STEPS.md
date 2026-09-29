@@ -1,9 +1,20 @@
 # @shrug/forgejo — Next Steps
 
-Local: `2026.09.29.1` (unpublished)
+Local: `2026.09.29.2` (unpublished)
 Covers: read queries + confirm-gated writes (repos, deploy keys, collaborators,
 teams, issues/comments, users, **labels**, **milestones**, issue label/milestone/
-assignee association).
+assignee association, **create_pull**).
+
+## Added in 2026.09.29.2
+
+- **`create_pull`** — open a pull request (POST /pulls; `head`/`base`/`title`
+  required, `base` not defaulted; optional `labels`/`milestone`/`assignees`).
+  Bare confirm-gated create; verify-first with `list_pulls` (Forgejo also rejects
+  duplicate open head->base PRs). `PullRequestSchema` extended additively with
+  `milestone`/`assignees` so the association is visible in the snapshot; the
+  state-dependent PR fields are `nullish` to avoid a post-mutation parse-throw on
+  the create response. Reviewers (separate endpoint), `merge_pull`,
+  `allow_maintainer_edit`, and `due_date` are deferred.
 
 ## Added in 2026.09.29.1
 
@@ -34,8 +45,9 @@ assignee association).
 
 ## 1. CRUD methods
 
-None of the write paths are implemented yet. Add these as a version bump with
-`export const extension` targeting `@shrug/forgejo`.
+> HISTORICAL (v1 backlog, superseded). Most write paths below now ship — see the
+> "Added in …" sections at the top of this file. Still outstanding: `merge_pull`,
+> `fork_repo`, `delete_release`, reviewer-request, and label/milestone edit/delete.
 
 ### Issues & pull requests
 

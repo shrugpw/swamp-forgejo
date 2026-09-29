@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/forgejo"
-version: "2026.09.29.1"
+version: "2026.09.29.2"
 description: |
   Drive [Forgejo](https://forgejo.org/) and [Gitea](https://gitea.io/) instances
   from swamp over their shared `/api/v1` REST surface, authenticated with a
@@ -29,7 +29,8 @@ description: |
   **remove_collaborator**, **add_org_team_member**, **create_issue** (`labels`
   are numeric IDs; `milestone` is a numeric ID), **edit_issue** (`milestone` set
   / `clear_milestone` unset; `assignees` replace/clear), **create_issue_comment**,
-  **add_issue_labels**,
+  **add_issue_labels**, **create_pull** (open a PR head->base; optional
+  labels/milestone/assignees),
   **create_label**, **create_milestone**, **create_user** (site-admin token).
 
   Label names and milestone titles are not unique in Forgejo/Gitea, and the
@@ -64,8 +65,8 @@ description: |
     project/board method ships.
   - Bare creates (`create_deploy_key`/`create_label`/`create_milestone`) are not
     idempotent — verify-first with the matching `list_*` (the caller's job).
-  - No PR merge path (`create_pull`/`merge_pull`) yet; no label/milestone
-    edit/delete surface yet.
+  - `create_pull` opens PRs, but there is no `merge_pull` or reviewer-request
+    path yet; no label/milestone edit/delete surface yet.
 
 repository: https://github.com/acme/swamp-forgejo
 
